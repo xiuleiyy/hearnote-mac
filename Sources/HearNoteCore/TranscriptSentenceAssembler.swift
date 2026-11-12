@@ -29,8 +29,10 @@ public struct TranscriptSentenceAssembler {
         self.maximumCharacters = max(20, maximumCharacters)
     }
 
+    public var hasPendingSentence: Bool { !pendingWords.isEmpty }
+
     /// 所有时间使用同一条绝对时间轴。replacingFrom 之前的未完句保留；
-    /// stableThrough 是已完成解码窗口的稳定范围，部分结果须两次前缀一致才按标点完成。
+    /// stableThrough 是已完成解码窗口的稳定范围；部分结果的标点及尾静音须先确认前缀稳定。
     /// followingWord 提供核心窗口之外的上下文，trailingSilenceFrom 只接受实际音频静音证据。
     public mutating func update(
         words: [TimedWord], replacingFrom: Double, observedThrough: Double,
@@ -138,8 +140,9 @@ public struct TranscriptSentenceAssembler {
         }
         if let last = current.last {
             let actualTrailingPause = trailingSilenceFrom.map {
-                followingWord == nil && $0.isFinite && observedThrough - $0 >= pauseInterval
+                followingWord == nil && $0.isFinite && observedThrough - $0 + 1e-9 >= pauseInterval
                     && last.end <= $0 + 0.25
+                    && isStable(current, previousWords: previousWords, through: stableThrough)
             } ?? false
             let followingPause = followingWord.map {
                 $0.start - last.end >= pauseInterval

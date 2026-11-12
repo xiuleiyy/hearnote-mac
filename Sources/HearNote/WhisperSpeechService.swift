@@ -756,13 +756,22 @@ final class WhisperLiveRecognizer: ObservableObject {
                         self.epochs.removeFirst()
                         continue
                     }
-                    guard complete || epoch.end - epoch.lastDecodedEnd >= 2.5 else { return }
                     let audioStart = max(0, epoch.coreStart - 3)
                     let audioEnd = min(epoch.end, epoch.coreStart + 15)
                     let lower = max(0, Int((audioStart - epoch.bufferStart) * Self.sampleRate))
                     let upper = min(epoch.samples.count, Int((audioEnd - epoch.bufferStart) * Self.sampleRate))
                     guard upper > lower else { return }
                     let snapshot = Array(epoch.samples[lower..<upper])
+                    let trailingSilenceFrom = WhisperDecodeSchedulingPolicy.trailingSilenceStart(
+                        samples: snapshot, audioStart: epoch.offset + audioStart
+                    )
+                    guard epoch.decodeScheduling.nextDecision(
+                        audioEnd: epoch.offset + audioEnd,
+                        lastDecodedEnd: epoch.offset + epoch.lastDecodedEnd,
+                        coreStart: epoch.offset + epoch.coreStart, complete: complete,
+                        hasPendingSentence: epoch.sentences.hasPendingSentence,
+                        hasTrailingSilence: trailingSilenceFrom != nil
+                    ) != nil else { return }
                     epoch.lastDecodedEnd = audioEnd
                     let results = try await self.service.decode(samples: snapshot,
                                                                 contextualStrings: terms,
@@ -771,10 +780,12 @@ final class WhisperLiveRecognizer: ObservableObject {
                     try Task.checkCancellation()
                     guard self.sessionID == session else { return }
                     self.publish(results, epoch: epoch, audioStart: audioStart,
-                                 audioEnd: audioEnd, coreEnd: coreEnd, complete: complete,
-                                 trailingSilenceFrom: Self.trailingSilenceStart(
-                                    samples: snapshot, audioStart: epoch.offset + audioStart
-                                 ))
+                                 audioEnd: audioEnd,
+                                 coreEnd: WhisperDecodeSchedulingPolicy.publicationEnd(
+                                    coreEnd: coreEnd, audioEnd: audioEnd, complete: complete,
+                                    hasTrailingSilence: trailingSilenceFrom != nil
+                                 ), complete: complete,
+                                 trailingSilenceFrom: trailingSilenceFrom)
                     if complete {
                         epoch.coreStart = coreEnd
                         if epoch.closed && epoch.coreStart >= epoch.end {
@@ -791,6 +802,11 @@ final class WhisperLiveRecognizer: ObservableObject {
                     } else if epoch.closed || !self.isRecognizing {
                         // finish 可能发生在 partial 的模型 await 期间。
                         // 再取闭合快照处理尾音，不能让最后一个请求仅靠截止 timer 收尾。
+                        continue
+                    } else if trailingSilenceFrom != nil, epoch.sentences.hasPendingSentence,
+                              epoch.end == audioEnd {
+                        // 帧已停在同一真实静音快照时立即有限确认，避免再等下一次 timer。
+                        // policy 每个 audioEnd 最多额外两次；新帧到达则退回常规调度。
                         continue
                     } else {
                         return
@@ -841,26 +857,6 @@ final class WhisperLiveRecognizer: ObservableObject {
         }
     }
 
-    /// 尾部停顿必须有采集 PCM 的静音证据，不能用解码窗口截断位置猜测。
-    /// 使用与无声解码筛选相同的保守能量阈值；背景声会延迟停顿完成而非丢词。
-    private static func trailingSilenceStart(samples: [Float], audioStart: Double) -> Double? {
-        let frameSize = 320
-        var index = samples.count
-        while index >= frameSize {
-            let start = index - frameSize
-            let frame = samples[start..<index]
-            var energy: Double = 0
-            for sample in frame {
-                guard sample.isFinite else { return nil }
-                energy += Double(sample) * Double(sample)
-            }
-            if sqrt(energy / Double(frameSize)) >= 0.0005 { break }
-            index = start
-        }
-        guard samples.count - index >= Int(Self.sampleRate * 0.8) else { return nil }
-        return audioStart + Double(index) / Self.sampleRate
-    }
-
     private func resolveFinishIfDone() {
         if !isRecognizing && epochs.isEmpty && processingTask == nil {
             deadline?.cancel(); deadline = nil
@@ -884,6 +880,7 @@ private final class AudioEpoch {
     var lastDecodedEnd: Double = 0
     var closed = false
     var sentences = TranscriptSentenceAssembler()
+    var decodeScheduling = WhisperDecodeSchedulingPolicy()
     var end: Double { bufferStart + Double(samples.count) / 16_000 }
     init(offset: Double) { self.offset = offset }
 }

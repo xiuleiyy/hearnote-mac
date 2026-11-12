@@ -56,10 +56,13 @@ final class TranscriptSentenceAssemblerTests: XCTestCase {
         XCTAssertFalse(changes[1].isFinal)
     }
 
-    func testTrailingSilenceCompletesCurrentSentence() {
+    func testTrailingSilenceCompletesCurrentSentenceAfterHypothesisAgreement() {
         var assembler = TranscriptSentenceAssembler()
         let words = [word("Thanks", 0, 0.5)]
-        let first = assembler.update(words: words, replacingFrom: 0, observedThrough: 0.6)
+        let first = assembler.update(words: words, replacingFrom: 0, observedThrough: 1.4,
+                                     trailingSilenceFrom: 0.5)
+        XCTAssertEqual(first.count, 1)
+        XCTAssertFalse(first[0].isFinal)
         let second = assembler.update(words: words, replacingFrom: 0, observedThrough: 1.4,
                                       trailingSilenceFrom: 0.5)
         XCTAssertEqual(second[0].segment.id, first[0].segment.id)
@@ -304,5 +307,52 @@ final class TranscriptSentenceAssemblerTests: XCTestCase {
         XCTAssertEqual(corrected[0].segment.id, first[1].segment.id)
         XCTAssertEqual(corrected[0].segment.text, "Corrected")
         XCTAssertFalse(corrected[0].isFinal)
+    }
+
+    func testFirstShortHypothesisWithRealSilenceCanStillBeCorrected() {
+        var assembler = TranscriptSentenceAssembler()
+        let first = assembler.update(
+            words: [word("reply count", 0, 0.8)], replacingFrom: 0, observedThrough: 2.5,
+            trailingSilenceFrom: 0.9
+        )
+        XCTAssertEqual(first.count, 1)
+        XCTAssertFalse(first[0].isFinal)
+        let correctedWords = [word("retry count", 0.02, 0.82)]
+        let corrected = assembler.update(
+            words: correctedWords, replacingFrom: 0, observedThrough: 2.5,
+            trailingSilenceFrom: 0.9
+        )
+        XCTAssertEqual(corrected.count, 1)
+        XCTAssertEqual(corrected[0].segment.id, first[0].segment.id)
+        XCTAssertEqual(corrected[0].segment.text, "retry count")
+        XCTAssertFalse(corrected[0].isFinal)
+        let confirmed = assembler.update(
+            words: correctedWords, replacingFrom: 0, observedThrough: 2.5,
+            trailingSilenceFrom: 0.9
+        )
+        XCTAssertEqual(confirmed.count, 1)
+        XCTAssertEqual(confirmed[0].segment.id, first[0].segment.id)
+        XCTAssertEqual(confirmed[0].segment.text, "retry count")
+        XCTAssertTrue(confirmed[0].isFinal)
+    }
+
+    func testActualFinishFlushesCorrectedTailWithoutWaitingForSecondAgreement() {
+        var assembler = TranscriptSentenceAssembler()
+        let first = assembler.update(
+            words: [word("reply count", 0, 0.8)], replacingFrom: 0, observedThrough: 2.5,
+            trailingSilenceFrom: 0.9
+        )
+        let corrected = assembler.update(
+            words: [word("retry count", 0.02, 0.82)], replacingFrom: 0, observedThrough: 2.5,
+            trailingSilenceFrom: 0.9
+        )
+        XCTAssertFalse(first[0].isFinal)
+        XCTAssertFalse(corrected[0].isFinal)
+        let finished = assembler.finish()
+        XCTAssertEqual(finished.count, 1)
+        XCTAssertEqual(finished[0].segment.id, first[0].segment.id)
+        XCTAssertEqual(finished[0].segment.text, "retry count")
+        XCTAssertTrue(finished[0].isFinal)
+        XCTAssertTrue(assembler.finish().isEmpty)
     }
 }
