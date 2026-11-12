@@ -24,6 +24,9 @@ binary, app = Path(sys.argv[1]), Path(sys.argv[2])
 with (app / "Contents/Info.plist").open("rb") as source:
     info = plistlib.load(source)
 assert info["LSMinimumSystemVersion"] == "14.0", "Info.plist 最低系统错误"
+assert info.get("CFBundleIconFile") == "HearNote.icns", "App 图标声明缺失或不符合资源名"
+icon = app / "Contents/Resources" / info["CFBundleIconFile"]
+assert icon.is_file() and icon.stat().st_size > 0, "App 图标资源缺失或为空"
 build = subprocess.check_output(["xcrun", "vtool", "-show-build", str(binary)], text=True)
 assert re.search(r"\bminos\s+14\.0\b", build), "Mach-O 部署目标不是 macOS 14.0"
 libraries = subprocess.check_output(["otool", "-L", str(binary)], text=True).splitlines()[1:]
@@ -55,6 +58,28 @@ hearnote_cleanup() {
 trap hearnote_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+iconutil -c iconset "$hearnote_app_path/Contents/Resources/HearNote.icns" \
+    -o "$hearnote_verify_stage/HearNote.iconset"
+python3 - "$hearnote_verify_stage/HearNote.iconset" <<'PY'
+import re, subprocess, sys
+from pathlib import Path
+iconset = Path(sys.argv[1])
+for points in (16, 32, 128, 256, 512):
+    for scale in (1, 2):
+        suffix = "@2x" if scale == 2 else ""
+        image = iconset / f"icon_{points}x{points}{suffix}.png"
+        assert image.is_file(), "ICNS 缺少图标尺寸：" + image.name
+        dimensions = subprocess.check_output(
+            ["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(image)], text=True
+        )
+        expected = points * scale
+        width = re.search(r"\bpixelWidth:\s+(\d+)", dimensions)
+        height = re.search(r"\bpixelHeight:\s+(\d+)", dimensions)
+        assert width and height, "无法读取图标尺寸：" + image.name
+        assert int(width[1]) == int(height[1]) == expected, "图标像素尺寸错误：" + image.name
+print("App 图标声明、ICNS 解码与 10 个普通／Retina 尺寸检查通过。")
+PY
 
 ditto "$hearnote_app_path" "$hearnote_verify_stage/HearNote.app"
 codesign --verify --strict "$hearnote_verify_stage/HearNote.app"
@@ -89,6 +114,8 @@ hearnote_mounted=1
 test -x "$hearnote_verify_stage/mount/HearNote.app/Contents/MacOS/HearNote"
 test "$(readlink "$hearnote_verify_stage/mount/Applications")" == "/Applications"
 codesign --verify --strict "$hearnote_verify_stage/mount/HearNote.app"
+cmp "$hearnote_app_path/Contents/Resources/HearNote.icns" \
+    "$hearnote_verify_stage/mount/HearNote.app/Contents/Resources/HearNote.icns"
 hdiutil detach "$hearnote_verify_stage/mount"
 hearnote_mounted=0
-echo "DMG 校验、只读挂载、App 签名与 Applications 快捷方式检查通过。"
+echo "DMG 校验、只读挂载、App 签名、图标一致性与 Applications 快捷方式检查通过。"

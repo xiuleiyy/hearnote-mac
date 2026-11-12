@@ -116,7 +116,7 @@ bash scripts/build-mac.sh --open
 Sources/HearNote/          SwiftUI、录音、系统音、Apple/Whisper 实时识别、Keychain
 Sources/HearNoteCore/      Bedrock、模型、本地库、导出
 Tests/HearNoteCoreTests/   不产生模型费用的核心测试
-Resources/                App 信息、权限用途与签名 entitlement
+Resources/                App 信息、权限用途、原创图标与签名 entitlement
 scripts/build-mac.sh      Mac 测试、构建、打包
 scripts/package-mac.sh    将已构建 App 打成 DMG
 scripts/ci-mac.sh         macOS CI 构建、验证与安装包归档

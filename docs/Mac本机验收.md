@@ -17,7 +17,9 @@ swift --version
 bash scripts/build-mac.sh --open
 ```
 
-预期核心测试、release 编译和签名验证通过，生成 `dist/HearNote.app` 并打开首次配置页。检查 `.app/Contents/Resources/` 中依赖 bundle 已复制；将 App 复制到 `/Applications` 再运行，确认不依赖原 `.build` 路径。
+预期核心测试、release 编译和签名验证通过，生成 `dist/HearNote.app` 并打开首次配置页。将 App 复制到 `/Applications` 再运行，确认不依赖原 `.build` 路径。
+
+图标验收：`Contents/Info.plist` 的 `CFBundleIconFile` 为 `HearNote.icns`，对应文件在 `Contents/Resources/` 中。安装后检查 Finder、Dock 与 `⌘Tab` 显示蓝青色声波笔记图标。更新已有 App 时先退出旧版本，再替换 Applications 中的 App；Dock 如果还显示旧图标，移除旧快捷方式并从 Applications 重新拖入，不清除用户笔记、设置或 Keychain。
 
 如有编译错误，保存复现步骤和最小修复，重跑失败检查。直接 `swift run` 不能代替带权限说明的 `.app` 验收。
 

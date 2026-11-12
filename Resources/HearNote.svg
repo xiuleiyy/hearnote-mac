@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>听记 HearNote</title>
+  <desc>蓝青色圆角方块，白色笔记纸上有声波与两行文字，表示声音转成笔记。</desc>
+  <defs>
+    <linearGradient id="background" x1="170" y1="110" x2="854" y2="926" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#39C6D6"/>
+      <stop offset="0.48" stop-color="#159DC6"/>
+      <stop offset="1" stop-color="#1261A9"/>
+    </linearGradient>
+    <radialGradient id="light" cx="246" cy="156" r="670" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="paper" x1="294" y1="224" x2="730" y2="800" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#ECF7FB"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="340" y1="336" x2="684" y2="716" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#159FB9"/>
+      <stop offset="1" stop-color="#1266AA"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="110" width="824" height="824" rx="185" fill="#093968" opacity="0.08"/>
+  <rect x="96" y="96" width="832" height="832" rx="188" fill="url(#background)"/>
+  <rect x="96" y="96" width="832" height="832" rx="188" fill="url(#light)"/>
+  <rect x="98" y="98" width="828" height="828" rx="186" fill="none" stroke="#FFFFFF" stroke-opacity="0.15" stroke-width="4"/>
+  <rect x="268" y="234" width="488" height="576" rx="84" fill="#083F76" opacity="0.13"/>
+  <rect x="268" y="224" width="488" height="576" rx="84" fill="url(#paper)"/>
+  <g fill="url(#ink)">
+    <rect x="340" y="406" width="40" height="76" rx="20"/>
+    <rect x="416" y="370" width="40" height="148" rx="20"/>
+    <rect x="492" y="328" width="40" height="232" rx="20"/>
+    <rect x="568" y="370" width="40" height="148" rx="20"/>
+    <rect x="644" y="406" width="40" height="76" rx="20"/>
+    <rect x="340" y="620" width="344" height="32" rx="16" opacity="0.9"/>
+    <rect x="340" y="688" width="220" height="32" rx="16" opacity="0.52"/>
+  </g>
+</svg>
