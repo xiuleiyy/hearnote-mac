@@ -10,6 +10,8 @@ preview/
 xcuserdata/
 .idea/
 .vscode/
+__pycache__/
+*.py[cod]
 
 # Credentials and machine-local configuration
 .env

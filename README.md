@@ -6,6 +6,14 @@
 
 独立“翻译”页面参考 iPhone 自带翻译的文字、语音、对话和收藏流程。它与会议记录共用 Bedrock API Key、Region、模型和术语表。详见 [安装使用](docs/安装使用.md) 和 [Mac 本机验收](docs/Mac本机验收.md)。
 
+## 下载与安装
+
+打开 [最新版下载](https://github.com/xiuleiyy/hearnote-mac/releases/latest)，在 Assets 下载 `HearNote-Mac-arm64.dmg`。仓库为 public，同事使用浏览器下载 Release 无需 GitHub 账号。
+
+支持 Apple Silicon Mac、macOS 14+；双击 DMG，将“听译”拖到 Applications 后启动，不需要 Xcode。当前未做 Developer ID 签名或 Apple 公证，首次可能需在系统“隐私与安全性”中允许打开。首次使用配置自己的 Bedrock API Key、授予录音权限并准备语音模型，详见安装说明。
+
+每次 `main` 更新通过 Mac 构建与检查后，自动发布最新 Release。新安装包上传并回下载校验成功后才更新 Latest，保留最近三个由此流程发布的版本，Git tag 保留。源码、构建日志和修复 diff 继续存放在 Actions artifact。
+
 ## 首版功能
 
 | 功能 | 当前实现 |
@@ -47,7 +55,7 @@ App 自动按型号适配：Sonnet 使用 Converse 的 `between_tools` 与低 ef
 
 需要 macOS 14+、Swift 5.10+ 和已完成首次初始化的完整 Xcode。要编译新的 Apple 本地识别分支，使用 Xcode 26+、Swift 6.2+ 和 macOS 26 SDK；交付 CI 会检查这一条件。Core 测试需要 Xcode 提供的 XCTest，仅安装 Command Line Tools 不够。首次构建会从 GitHub 下载精确版本 `1.1.1` 的 WhisperKit 和它的依赖。
 
-仓库为 private，需要当前 GitHub 账号有访问权限。登录 GitHub 后取得源码：
+仓库为 public，可直接取得源码：
 
 ```bash
 git clone https://github.com/xiuleiyy/hearnote-mac.git
@@ -61,7 +69,7 @@ bash scripts/build-mac.sh --open
 
 本机验收成功后执行 `bash scripts/package-mac.sh`，生成 `dist/听译.dmg`；打开后将 App 拖到 Applications。该脚本使用已构建的 App，不重复编译和测试。
 
-仓库的“Mac 安装包”GitHub Actions 使用 macOS arm64 runner 运行相同构建脚本。成功时产出 App ZIP、DMG、含依赖锁文件的源码 ZIP、真实日志、修复 diff 和 SHA-256；登录 GitHub 后在成功运行的 Artifacts 下载 `HearNote-Mac-arm64`。CI 验证构建、签名、移动后启动与镜像挂载，音频、GUI 和真实模型调用仍需 Mac 功能验收。
+仓库的“Mac 安装包”GitHub Actions 使用 macOS arm64 runner 运行相同构建脚本。成功时自动把 App ZIP、DMG、安装说明与 SHA-256 发布到 Releases；含依赖锁文件的源码 ZIP、真实日志和修复 diff 仍可在成功运行的 Artifacts 下载 `HearNote-Mac-arm64`。CI 验证构建、签名、移动后启动与镜像挂载，音频、GUI 和真实模型调用仍需 Mac 功能验收。
 
 ## 独立翻译
 
@@ -130,12 +138,13 @@ scripts/build-mac.sh      Mac 测试、构建、打包
 scripts/package-mac.sh    将已构建 App 打成 DMG
 scripts/ci-mac.sh         macOS CI 构建、验证与安装包归档
 scripts/verify-mac-build.sh  架构、签名、移动后启动与 DMG 挂载
+scripts/release-mac.py    发布成功构建、校验远端资产、保留三个 Release
 docs/                     安装与 Mac 实机验收
 ```
 
 下载与编译完成后，录音、转写、回听和本地笔记在 Mac 内执行，Bedrock 调用从 Mac 发起。
 
-后续修改应按 [AGENTS.md](AGENTS.md) 完成检查、提交并推送到私有 GitHub 仓库；本机 Claude／Codex 的使用说明见安装文档。
+后续修改应按 [AGENTS.md](AGENTS.md) 完成检查、提交并推送到 GitHub 仓库，再核对自动发布结果；本机 Claude／Codex 的使用说明见安装文档。
 
 ## 官方接口依据
 

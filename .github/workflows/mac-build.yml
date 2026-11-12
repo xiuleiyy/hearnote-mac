@@ -4,25 +4,18 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths:
-      - 'Sources/**'
-      - 'Tests/**'
-      - 'Resources/**'
-      - 'scripts/**'
-      - 'Package.swift'
-      - 'Package.resolved'
-      - '.github/workflows/mac-build.yml'
 
 permissions:
   contents: read
 
 concurrency:
   group: mac-build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
-    if: github.event.repository.private == true
+    name: build
+    if: github.ref == 'refs/heads/main'
     runs-on: macos-26
     timeout-minutes: 30
     steps:
@@ -30,6 +23,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: 验证发布与保留版本规则
+        run: python3 -m unittest discover -s scripts/tests -p 'test_release_mac.py' -v
 
       - name: 编译、测试、签名与安装包验证
         env:
@@ -46,3 +42,35 @@ jobs:
           path: dist/ci/
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: 发布最新版并保留三个版本
+    needs: build
+    if: github.repository == 'xiuleiyy/hearnote-mac' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: 读取本次成功构建的安装包
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: HearNote-Mac-arm64
+          path: dist/ci
+
+      - name: 发布并核验安装包，成功后清理旧版
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          python3 scripts/release-mac.py
+          --dist dist/ci
+          --repo "$GITHUB_REPOSITORY"
+          --commit "$GITHUB_SHA"
+          --run-id "$GITHUB_RUN_ID"
+          --build-job build
+          --retain 3
