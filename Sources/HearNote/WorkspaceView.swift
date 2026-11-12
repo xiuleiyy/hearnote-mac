@@ -53,6 +53,7 @@ struct WorkspaceView: View {
         .tint(Palette.actionFill)
         .background(Palette.paper)
         .sheet(isPresented: $state.showSettings) { SettingsView().environmentObject(state) }
+        .onChange(of: state.preferences.speechLocale) { _, _ in state.persistPreferences() }
         .onChange(of: state.preferences.targetLanguage) { _, _ in state.persistPreferences() }
         .alert("需要处理", isPresented: Binding(
             get: { state.errorMessage != nil },

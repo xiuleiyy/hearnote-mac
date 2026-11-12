@@ -36,9 +36,10 @@ struct AppPreferences: Codable {
         Self.defaultModel, Self.kimiModel, Self.glmModel, Self.gptModel
     ]
     private var modelPresetVersion = 2
-    var speechLocale = "zh-en"
+    private var meetingDefaultsVersion = 1
+    var speechLocale = "en-US"
     var speechEngine = SpeechRecognitionEngine.whisper
-    var targetLanguage = BedrockClient.bilingualLanguage
+    var targetLanguage = "简体中文"
     var whisperModel = "large-v3-v20240930_turbo"
     var allowCloudRecognition = false
     var vocabulary = ""
@@ -47,7 +48,7 @@ struct AppPreferences: Codable {
     init() {}
     private enum CodingKeys: String, CodingKey {
         case region, modelID, models, modelPresetVersion, speechLocale, speechEngine, targetLanguage, whisperModel
-        case allowCloudRecognition, vocabulary, glossary, hasCompletedSetup
+        case allowCloudRecognition, vocabulary, glossary, hasCompletedSetup, meetingDefaultsVersion
     }
     init(from decoder: Decoder) throws {
         let saved = try decoder.container(keyedBy: CodingKeys.self)
@@ -64,6 +65,13 @@ struct AppPreferences: Codable {
         glossary = try saved.decodeIfPresent(String.self, forKey: .glossary) ?? glossary
         hasCompletedSetup = try saved.decodeIfPresent(Bool.self, forKey: .hasCompletedSetup) ?? hasCompletedSetup
         migrateModelPresets()
+        meetingDefaultsVersion = try saved.decodeIfPresent(Int.self, forKey: .meetingDefaultsVersion) ?? 0
+        if meetingDefaultsVersion < 1 {
+            // 已安装版本首次升级也采用新默认；之后保留用户自行选择的语言。
+            speechLocale = "en-US"
+            targetLanguage = "简体中文"
+            meetingDefaultsVersion = 1
+        }
     }
     private mutating func migrateModelPresets() {
         guard modelPresetVersion < 2 else { return }
@@ -193,6 +201,7 @@ final class AppState: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: "HearNote.preferences"),
            let saved = try? JSONDecoder().decode(AppPreferences.self, from: data) {
             preferences = saved
+            persistPreferences()
         }
         do {
             documents = try repository.load()
