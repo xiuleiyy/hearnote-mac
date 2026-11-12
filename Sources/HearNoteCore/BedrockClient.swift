@@ -288,7 +288,10 @@ public struct BedrockClient {
 
     func makeRequest(system: String, text: String, maxTokens: Int) throws -> URLRequest {
         guard configuration.isConfigured else { throw BedrockError.invalidConfiguration }
-        guard !apiKey.isEmpty, !apiKey.contains("\r"), !apiKey.contains("\n") else {
+        // CRLF 可合成一个 Character；按 Unicode scalar 拒绝控制字符和非 ASCII 内容。
+        guard !apiKey.isEmpty, apiKey.unicodeScalars.allSatisfy({
+            (0x21...0x7E).contains($0.value)
+        }) else {
             throw BedrockError.invalidAPIKey
         }
         var allowed = CharacterSet.alphanumerics

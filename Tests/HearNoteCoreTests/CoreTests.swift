@@ -393,6 +393,39 @@ final class BedrockClientTests: XCTestCase {
         XCTAssertThrowsError(try badKey.makeRequest(system: "", text: "", maxTokens: 1))
     }
 
+    func testAPIKeyRejectsEmbeddedControlsWhitespaceAndNonASCIIScalars() {
+        for key in [
+            "", " \t\r\n ",
+            "synthetic\rtoken", "synthetic\ntoken", "synthetic\r\ntoken",
+            "synthetic\ttoken", "synthetic\u{0000}token", "synthetic\u{001F}token",
+            "synthetic\u{007F}token", "synthetic\u{0085}token",
+            "synthetic\u{2028}token", "synthetic\u{2029}token",
+            "synthetic\u{00A0}token", "synthetic\u{200B}token", "synthetic中token",
+            "synthetic token"
+        ] {
+            let invalid = BedrockClient(configuration: configuration, apiKey: key)
+            XCTAssertThrowsError(try invalid.makeRequest(system: "", text: "", maxTokens: 1)) {
+                XCTAssertEqual($0 as? BedrockError, .invalidAPIKey)
+                XCTAssertFalse($0.localizedDescription.contains("synthetic"))
+            }
+        }
+    }
+
+    func testAPIKeyPreservesVisibleASCIIAndTrimsPastedSurroundingWhitespace() throws {
+        let token = "synthetic-token_+/=7"
+        for pasted in [
+            token,
+            "  \(token)  ",
+            "\t\r\n\(token)\r\n\t",
+            "\u{00A0}\(token)\u{00A0}"
+        ] {
+            let request = try BedrockClient(configuration: configuration, apiKey: pasted).makeRequest(
+                system: "", text: "", maxTokens: 1
+            )
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer \(token)")
+        }
+    }
+
     func testChunksPreserveEveryUnicodeCharacterAndSource() throws {
         let original = String(repeating: "语言🌊🙂甲乙丙", count: 2000)
         let chunks = try client().inputChunks([

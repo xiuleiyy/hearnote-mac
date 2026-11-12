@@ -106,7 +106,7 @@ bash scripts/build-mac.sh --open
 
 ## 验证状态
 
-本机反馈发现播放器析构的 actor 隔离编译错误，以及测试 mock 未读取 Darwin 请求体 stream。这两处已修复，Linux Core XCTest 57 项通过，包含导出、本地库、API Key 调用、多模型协议、中英双向请求、实时翻译开关、排队、修订保护及请求体 stream 回归。macOS 完整构建结果以对应提交的“Mac 安装包”CI 日志为准。
+本机反馈发现播放器析构的 actor 隔离编译错误，以及测试 mock 未读取 Darwin 请求体 stream。这两处已修复，并按 Mac CI 的实际结果修正 Key 的控制字符校验。Linux Core XCTest 59 项通过，包含导出、本地库、API Key 调用、多模型协议、中英双向请求、实时翻译开关、排队、修订保护、请求体 stream 和 Key 校验回归。macOS 完整构建结果以对应提交的“Mac 安装包”CI 日志为准。
 
 具体步骤见 [Mac 本机验收](docs/Mac本机验收.md)。准确率、实际翻译延迟、会议持续录音稳定性尚未经过 Mac 实机测量，不给未经验证的保证。
 
