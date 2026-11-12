@@ -59,7 +59,7 @@ struct MacEchoHarness {
     }
 
     @MainActor
-    static func processor(name: String, root: URL, epoch: Double, collector: Collector) throws -> MeetingEchoProcessor {
+    private static func processor(name: String, root: URL, epoch: Double, collector: Collector) throws -> MeetingEchoProcessor {
         let directory = root.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return try MeetingEchoProcessor(
@@ -70,7 +70,7 @@ struct MacEchoHarness {
     }
 
     @MainActor
-    static func verifyFile(_ result: MeetingEchoProcessor.Result, collector: Collector,
+    private static func verifyFile(_ result: MeetingEchoProcessor.Result, collector: Collector,
                            expected: Int, name: String) throws {
         try require(result.failure == nil, "\(name): \(result.failure ?? "")")
         guard let url = result.url else { throw HarnessFailure.assertion("\(name): missing CAF") }
