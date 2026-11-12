@@ -69,7 +69,7 @@ struct WorkspaceView: View {
                 Text("Mac").font(.caption).foregroundStyle(.tertiary)
             }.padding(.top, 25)
             HStack(spacing: 6) {
-                workspaceButton("听译", systemImage: "waveform", tab: .notes)
+                workspaceButton("听见", systemImage: "waveform", tab: .notes)
                 workspaceButton("翻译", systemImage: "character.bubble", tab: .translation)
             }
             Button { state.openMeetingWorkspace() } label: {
