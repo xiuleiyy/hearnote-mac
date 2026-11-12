@@ -3,7 +3,7 @@ set -euo pipefail
 
 hearnote_project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$hearnote_project_root"
-hearnote_app_path="$hearnote_project_root/dist/HearNote.app"
+hearnote_app_path="$hearnote_project_root/dist/听译.app"
 hearnote_binary="$hearnote_app_path/Contents/MacOS/HearNote"
 hearnote_expected_arch="${HEARNOTE_EXPECTED_ARCH:-$(uname -m)}"
 hearnote_arch="$(lipo -archs "$hearnote_binary")"
@@ -24,6 +24,9 @@ binary, app = Path(sys.argv[1]), Path(sys.argv[2])
 with (app / "Contents/Info.plist").open("rb") as source:
     info = plistlib.load(source)
 assert info["LSMinimumSystemVersion"] == "14.0", "Info.plist 最低系统错误"
+assert info.get("CFBundleName") == info.get("CFBundleDisplayName") == "听译", "App 显示名称错误"
+assert info.get("CFBundleIdentifier") == "app.hearnote.mac", "App 身份必须沿用现有标识"
+assert info.get("CFBundleExecutable") == "HearNote", "App 可执行文件声明错误"
 assert info.get("CFBundleIconFile") == "HearNote.icns", "App 图标声明缺失或不符合资源名"
 icon = app / "Contents/Resources" / info["CFBundleIconFile"]
 assert icon.is_file() and icon.stat().st_size > 0, "App 图标资源缺失或为空"
@@ -81,14 +84,14 @@ for points in (16, 32, 128, 256, 512):
 print("App 图标声明、ICNS 解码与 10 个普通／Retina 尺寸检查通过。")
 PY
 
-ditto "$hearnote_app_path" "$hearnote_verify_stage/HearNote.app"
-codesign --verify --strict "$hearnote_verify_stage/HearNote.app"
+ditto "$hearnote_app_path" "$hearnote_verify_stage/听译.app"
+codesign --verify --strict "$hearnote_verify_stage/听译.app"
 # 隐藏构建缓存，确保移动后启动不借助原 .build 路径回退。
 if [[ -d .build ]]; then
     mv .build "$hearnote_verify_stage/build-cache"
 fi
 mkdir -p dist/ci
-"$hearnote_verify_stage/HearNote.app/Contents/MacOS/HearNote" \
+"$hearnote_verify_stage/听译.app/Contents/MacOS/HearNote" \
     > dist/ci/startup-smoke.log 2>&1 &
 hearnote_smoke_pid=$!
 for hearnote_second in {1..8}; do
@@ -106,16 +109,16 @@ if [[ -d "$hearnote_verify_stage/build-cache" ]]; then
     mv "$hearnote_verify_stage/build-cache" .build
 fi
 
-hdiutil verify dist/HearNote.dmg
+hdiutil verify dist/听译.dmg
 mkdir "$hearnote_verify_stage/mount"
-hdiutil attach dist/HearNote.dmg -readonly -nobrowse \
+hdiutil attach dist/听译.dmg -readonly -nobrowse \
     -mountpoint "$hearnote_verify_stage/mount"
 hearnote_mounted=1
-test -x "$hearnote_verify_stage/mount/HearNote.app/Contents/MacOS/HearNote"
+test -x "$hearnote_verify_stage/mount/听译.app/Contents/MacOS/HearNote"
 test "$(readlink "$hearnote_verify_stage/mount/Applications")" == "/Applications"
-codesign --verify --strict "$hearnote_verify_stage/mount/HearNote.app"
+codesign --verify --strict "$hearnote_verify_stage/mount/听译.app"
 cmp "$hearnote_app_path/Contents/Resources/HearNote.icns" \
-    "$hearnote_verify_stage/mount/HearNote.app/Contents/Resources/HearNote.icns"
+    "$hearnote_verify_stage/mount/听译.app/Contents/Resources/HearNote.icns"
 hdiutil detach "$hearnote_verify_stage/mount"
 hearnote_mounted=0
 echo "DMG 校验、只读挂载、App 签名、图标一致性与 Applications 快捷方式检查通过。"

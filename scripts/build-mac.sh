@@ -33,10 +33,10 @@ cd "$project_root"
 swift test
 swift build -c release
 binary_dir="$(swift build -c release --show-bin-path)"
-app_path="$project_root/dist/HearNote.app"
+app_path="$project_root/dist/听译.app"
 mkdir -p "$project_root/dist"
 hearnote_stage="$(mktemp -d "$project_root/dist/.hearnote-build.XXXXXX")"
-hearnote_stage_app="$hearnote_stage/HearNote.app"
+hearnote_stage_app="$hearnote_stage/听译.app"
 hearnote_cleanup() {
     if [[ -d "$hearnote_stage/previous.app" && ! -e "$app_path" ]]; then
         mv "$hearnote_stage/previous.app" "$app_path"

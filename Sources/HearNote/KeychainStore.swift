@@ -57,7 +57,7 @@ enum KeychainStore {
     struct KeychainError: LocalizedError {
         let status: OSStatus
         var errorDescription: String? {
-            "无法访问 macOS 钥匙串（\(status)）。请确认钥匙串已解锁，并允许听记访问该密钥。"
+            "无法访问 macOS 钥匙串（\(status)）。请确认钥匙串已解锁，并允许听译访问该密钥。"
         }
     }
 }

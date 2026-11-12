@@ -39,9 +39,9 @@ if ! bash scripts/verify-mac-build.sh 2>&1 | tee dist/ci/verify.log; then
     exit 1
 fi
 
-ditto -c -k --keepParent dist/HearNote.app \
+ditto -c -k --keepParent dist/听译.app \
     "dist/ci/HearNote-Mac-arm64-$hearnote_short_commit.app.zip"
-cp dist/HearNote.dmg "dist/ci/HearNote-Mac-arm64-$hearnote_short_commit.dmg"
+cp dist/听译.dmg "dist/ci/HearNote-Mac-arm64-$hearnote_short_commit.dmg"
 hearnote_archive_stage="$(mktemp -d "${TMPDIR:-/tmp}/hearnote-source.XXXXXX")"
 trap 'rm -rf "$hearnote_archive_stage"' EXIT
 git archive --format=tar --prefix=HearNote/ HEAD | tar -xf - -C "$hearnote_archive_stage"
@@ -59,7 +59,7 @@ git diff "$hearnote_feedback_base" HEAD -- Sources/ Tests/ scripts/ Resources/ P
     shasum -a 256 *.app.zip *.dmg HearNote-Mac-Source-*.zip > SHA256SUMS
 )
 {
-    echo "# HearNote macOS CI 构建交付"
+    echo "# 听译 macOS CI 构建交付"
     echo
     echo "- 源码提交：\`$hearnote_commit\`"
     echo "- 修复 diff 基线：\`$hearnote_feedback_base\`。"

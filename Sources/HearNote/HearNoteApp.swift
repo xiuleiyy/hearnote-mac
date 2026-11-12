@@ -8,7 +8,7 @@ struct HearNoteApp: App {
     @NSApplicationDelegateAdaptor(HearNoteAppDelegate.self) private var delegate
     @StateObject private var state = AppState()
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("听译") {
             WorkspaceView()
                 .environmentObject(state)
                 .frame(minWidth: 900, minHeight: 600)
@@ -54,7 +54,7 @@ import Foundation
 @main
 enum HearNoteUnsupportedHost {
     static func main() {
-        print("HearNote 是 macOS App。Linux 主机仅支持 HearNoteCore 的测试。")
+        print("听译是 macOS App。Linux 主机仅支持 HearNoteCore 的测试。")
     }
 }
 #endif

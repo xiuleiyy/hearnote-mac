@@ -29,9 +29,9 @@ enum MediaServiceError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .microphonePermission:
-            return "无法访问麦克风。请在系统设置 → 隐私与安全性 → 麦克风中允许听记。"
+            return "无法访问麦克风。请在系统设置 → 隐私与安全性 → 麦克风中允许听译。"
         case .speechPermission:
-            return "语音识别权限未开启。请在系统设置 → 隐私与安全性 → 语音识别中允许听记。"
+            return "语音识别权限未开启。请在系统设置 → 隐私与安全性 → 语音识别中允许听译。"
         case .localRecognitionUnavailable(let locale):
             return "此 Mac 当前不支持 \(locale) 的本地语音识别。可换一种语言，或在设置里明确允许 Apple 在线识别。"
         case .speechUnavailable:

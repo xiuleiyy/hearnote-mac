@@ -32,7 +32,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 23) {
             HStack {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text(draft.hasCompletedSetup ? "设置" : "让听记连接你的 Bedrock")
+                    Text(draft.hasCompletedSetup ? "设置" : "让听译连接你的 Bedrock")
                         .font(.title2.weight(.semibold))
                     Text("填入 Bedrock API Key 后测试连接。区域和模型已预选，可随时调整。")
                         .font(.callout).foregroundStyle(.secondary)

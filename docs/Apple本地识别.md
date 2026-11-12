@@ -1,6 +1,6 @@
 # Apple 本地识别
 
-macOS 26 配合 Swift 6.2+ / macOS 26 SDK 构建的听记，使用 `SpeechAnalyzer` 和 `Speech.SpeechTranscriber`，不先调用旧 `SFSpeechRecognizer` 授权。这条语音处理路径无需开启 Siri／系统听写。设备或语言不支持新转写模块时，会在同一套本地分析接口内尝试 `DictationTranscriber`，并显示实际后端；失败会明确提示，不会暗中改为联网识别或旧 Siri 接口。
+macOS 26 配合 Swift 6.2+ / macOS 26 SDK 构建的听译，使用 `SpeechAnalyzer` 和 `Speech.SpeechTranscriber`，不先调用旧 `SFSpeechRecognizer` 授权。这条语音处理路径无需开启 Siri／系统听写。设备或语言不支持新转写模块时，会在同一套本地分析接口内尝试 `DictationTranscriber`，并显示实际后端；失败会明确提示，不会暗中改为联网识别或旧 Siri 接口。
 
 ## 使用
 

@@ -1,10 +1,10 @@
-# 听记 · HearNote for Mac
+# 听译 · HearNote for Mac
 
 原生 SwiftUI Mac App：录制麦克风和会议软件声音，实时显示原文与翻译，会议后生成带时间戳的摘要、决定和待办。App 在 Mac 本机运行，直接连接所选 Bedrock Region。
 
 首版以速度和准确性为目标：先显示实时原文，稳定后翻译；重点核对人名、数字、专业术语、否定词和不确定表述。Region 和模型的选择以本机实际延迟与译文核对结果为依据。
 
-独立“翻译”页面参考 iPhone 自带翻译的文字、语音、对话和收藏流程。它与会议听记共用 Bedrock API Key、Region、模型和术语表。详见 [安装使用](docs/安装使用.md) 和 [Mac 本机验收](docs/Mac本机验收.md)。
+独立“翻译”页面参考 iPhone 自带翻译的文字、语音、对话和收藏流程。它与会议记录共用 Bedrock API Key、Region、模型和术语表。详见 [安装使用](docs/安装使用.md) 和 [Mac 本机验收](docs/Mac本机验收.md)。
 
 ## 首版功能
 
@@ -56,9 +56,9 @@ bash scripts/build-mac.sh --open
 
 也可双击 `开始使用.command`。首次缺少编译工具时，安装并打开完整 Xcode，完成许可证与组件初始化，再在 Xcode → Settings → Locations 选择编译工具。
 
-脚本先执行 `swift test`，再编译并生成 `dist/HearNote.app`，复制依赖的资源 bundle，最后做本地 ad-hoc 签名。构建不安装后台服务，不发布 App Store。生成的 `.app` 可复制到 Mac 的 `/Applications`；当前未进行 Developer ID 签名或公证。
+脚本先执行 `swift test`，再编译并生成 `dist/听译.app`，复制依赖的资源 bundle，最后做本地 ad-hoc 签名。构建不安装后台服务，不发布 App Store。生成的 `.app` 可复制到 Mac 的 `/Applications`；当前未进行 Developer ID 签名或公证。
 
-本机验收成功后执行 `bash scripts/package-mac.sh`，生成 `dist/HearNote.dmg`；打开后将 App 拖到 Applications。该脚本使用已构建的 App，不重复编译和测试。
+本机验收成功后执行 `bash scripts/package-mac.sh`，生成 `dist/听译.dmg`；打开后将 App 拖到 Applications。该脚本使用已构建的 App，不重复编译和测试。
 
 仓库的“Mac 安装包”GitHub Actions 使用 macOS arm64 runner 运行相同构建脚本。成功时产出 App ZIP、DMG、含依赖锁文件的源码 ZIP、真实日志、修复 diff 和 SHA-256；登录 GitHub 后在成功运行的 Artifacts 下载 `HearNote-Mac-arm64`。CI 验证构建、签名、移动后启动与镜像挂载，音频、GUI 和真实模型调用仍需 Mac 功能验收。
 

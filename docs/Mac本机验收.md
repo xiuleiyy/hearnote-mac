@@ -1,4 +1,4 @@
-# HearNote：Mac 本机验收
+# 听译：Mac 本机验收
 
 目标是确认 App 在实际 Mac 上运行，并分别测量识别、翻译质量与延迟。Core 测试与 CI 构建、启动检查不能替代麦克风／系统音采集、本地模型推理和 GUI 功能验收。
 
@@ -17,9 +17,11 @@ swift --version
 bash scripts/build-mac.sh --open
 ```
 
-预期核心测试、release 编译和签名验证通过，生成 `dist/HearNote.app` 并打开首次配置页。将 App 复制到 `/Applications` 再运行，确认不依赖原 `.build` 路径。
+预期核心测试、release 编译和签名验证通过，生成 `dist/听译.app` 并打开首次配置页。将 App 复制到 `/Applications` 再运行，确认不依赖原 `.build` 路径。
 
 图标验收：`Contents/Info.plist` 的 `CFBundleIconFile` 为 `HearNote.icns`，对应文件在 `Contents/Resources/` 中。安装后检查 Finder、Dock 与 `⌘Tab` 显示蓝青色声波笔记图标。更新已有 App 时先退出旧版本，再替换 Applications 中的 App；Dock 如果还显示旧图标，移除旧快捷方式并从 Applications 重新拖入，不清除用户笔记、设置或 Keychain。
+
+名称验收：安装的 App 为 `听译.app`，窗口、侧栏、Finder、Dock 与权限提示显示“听译”。从新版打开已有笔记，核对原有录音、偏好和已配置 Key 仍可使用；不要删除数据或重置权限来模拟升级成功。
 
 如有编译错误，保存复现步骤和最小修复，重跑失败检查。直接 `swift run` 不能代替带权限说明的 `.app` 验收。
 
@@ -121,7 +123,7 @@ bash scripts/build-mac.sh --open
 
 7. 分别测“语音结束→原文完成”“提交→完整译文”“图片导入→OCR 完成”，不能把文字翻译速度当语音端到端速度。
 
-## 6. 听记整理与导出
+## 6. 笔记整理与导出
 
 - 导入 WAV／M4A／MP3 和带音轨 MP4，至少一份超过 3 分钟；损坏文件或无音轨视频清晰报错，不丢已有库。
 
@@ -149,4 +151,4 @@ bash scripts/build-mac.sh --open
 bash scripts/package-mac.sh
 ```
 
-挂载 `dist/HearNote.dmg`，检查 App 与 Applications 快捷方式，从安装后的 App 再启动。交付 `.app`／`.dmg` 本机绝对路径；只有真正构建并跑过核心功能，才标为“Mac 实机验证完成”。
+挂载 `dist/听译.dmg`，检查 App 与 Applications 快捷方式，从安装后的 App 再启动。交付 `.app`／`.dmg` 本机绝对路径；只有真正构建并跑过核心功能，才标为“Mac 实机验证完成”。

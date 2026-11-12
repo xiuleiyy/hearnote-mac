@@ -65,11 +65,11 @@ struct WorkspaceView: View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 9) {
                 Image(systemName: "waveform").font(.title2).foregroundStyle(Palette.accent)
-                Text("听记").font(.title2.weight(.semibold))
+                Text("听译").font(.title2.weight(.semibold))
                 Text("Mac").font(.caption).foregroundStyle(.tertiary)
             }.padding(.top, 25)
             HStack(spacing: 6) {
-                workspaceButton("听记", systemImage: "waveform", tab: .notes)
+                workspaceButton("听译", systemImage: "waveform", tab: .notes)
                 workspaceButton("翻译", systemImage: "character.bubble", tab: .translation)
             }
             Button { state.openMeetingWorkspace() } label: {

@@ -773,10 +773,10 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
             return
         case .notDetermined:
             guard await AVCaptureDevice.requestAccess(for: .audio) else {
-                throw TranslationWorkspaceIssue("请在系统设置的麦克风权限中允许听记。")
+                throw TranslationWorkspaceIssue("请在系统设置的麦克风权限中允许听译。")
             }
         default:
-            throw TranslationWorkspaceIssue("请在系统设置的麦克风权限中允许听记。")
+            throw TranslationWorkspaceIssue("请在系统设置的麦克风权限中允许听译。")
         }
     }
 

@@ -44,7 +44,7 @@ private enum MeetingRecorderError: LocalizedError {
         case .busy:
             return "录音正在开始或保存，请稍后再试。"
         case .microphoneDenied:
-            return "麦克风权限未获允许。请在「系统设置 → 隐私与安全性 → 麦克风」允许听记。"
+            return "麦克风权限未获允许。请在「系统设置 → 隐私与安全性 → 麦克风」允许听译。"
         case .noAudio:
             return "本次没有录制到音频。请检查所选声音来源和系统权限后重试。"
         case .exportFailed(let detail, let recoveryDirectory):

@@ -2,8 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>听记</string>
-    <key>CFBundleDisplayName</key><string>听记</string>
+    <key>CFBundleName</key><string>听译</string>
+    <key>CFBundleDisplayName</key><string>听译</string>
     <key>CFBundleExecutable</key><string>HearNote</string>
     <key>CFBundleIconFile</key><string>HearNote.icns</string>
     <key>CFBundleIdentifier</key><string>app.hearnote.mac</string>
@@ -13,10 +13,10 @@
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>听记使用麦克风录制你的发言，并实时转成文字。</string>
+    <string>听译使用麦克风录制你的发言，并实时转成文字。</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>听记使用 Apple Speech 将音频转换成文字。默认使用设备端识别，联网识别需在设置中开启。</string>
+    <string>听译使用 Apple Speech 将音频转换成文字。默认使用设备端识别，联网识别需在设置中开启。</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>听记使用系统录制权限接收 Zoom、飞书等软件播放的声音，不保存屏幕图像。</string>
+    <string>听译使用系统录制权限接收 Zoom、飞书等软件播放的声音，不保存屏幕图像。</string>
 </dict>
 </plist>

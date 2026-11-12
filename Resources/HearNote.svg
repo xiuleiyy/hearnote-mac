@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <title>听记 HearNote</title>
+  <title>听译 HearNote</title>
   <desc>蓝青色圆角方块，白色笔记纸上有声波与两行文字，表示声音转成笔记。</desc>
   <defs>
     <linearGradient id="background" x1="170" y1="110" x2="854" y2="926" gradientUnits="userSpaceOnUse">
