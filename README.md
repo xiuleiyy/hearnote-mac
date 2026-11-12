@@ -54,6 +54,7 @@ App 自动按型号适配：Sonnet 使用 Converse 的 `between_tools` 与低 ef
 ## 在 Mac 上构建
 
 需要 macOS 14+、Swift 5.10+ 和已完成首次初始化的完整 Xcode。要编译新的 Apple 本地识别分支，使用 Xcode 26+、Swift 6.2+ 和 macOS 26 SDK；交付 CI 会检查这一条件。Core 测试需要 Xcode 提供的 XCTest，仅安装 Command Line Tools 不够。首次构建会从 GitHub 下载精确版本 `1.1.1` 的 WhisperKit 和它的依赖。
+交付 CI 使用标准 `macos-15` Apple Silicon runner，显式选择 Xcode 26.2（Swift 6.2.3／macOS 26.2 SDK）；App 的安装目标是 macOS 14+，macOS 26 的新语音运行路径需在 Mac 26 上验收。
 
 仓库为 public，可直接取得源码：
 

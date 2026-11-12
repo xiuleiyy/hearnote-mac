@@ -16,13 +16,19 @@ jobs:
   build:
     name: build
     if: github.ref == 'refs/heads/main'
-    runs-on: macos-26
+    # 标准 Apple Silicon runner；显式使用可编译新 Speech API 的工具链。
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: 选择 Xcode 26.2
+        run: sudo xcode-select --switch "$DEVELOPER_DIR"
 
       - name: 验证发布与保留版本规则
         run: python3 -m unittest discover -s scripts/tests -p 'test_release_mac.py' -v
