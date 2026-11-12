@@ -121,9 +121,14 @@ struct SettingsView: View {
                                     }
                                 )
                             } else {
-                                Toggle("允许 Apple 联网语音识别", isOn: $draft.allowCloudRecognition)
-                                Text("Apple 识别依赖 macOS 的 Siri／听写设置。开启联网选项后，音频可能交给 Apple 识别。")
-                                    .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
+                                if AppleSpeechAvailability.usesAnalyzer {
+                                    Text("使用 macOS 的 Apple 本地识别，无需开启 Siri／听写。首次使用某种语言时，系统可能需要下载识别资源；准备进度会显示在会议中。语音在这台 Mac 处理。")
+                                        .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
+                                } else {
+                                    Toggle("允许 Apple 联网语音识别", isOn: $draft.allowCloudRecognition)
+                                    Text("旧版 Apple 识别依赖 macOS 的 Siri／听写设置。开启联网选项后，音频可能交给 Apple 识别。macOS 26 配合新版编译工具可使用新的本地识别。")
+                                        .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
+                                }
                             }
                             Text("常用专有词（每行一个）").font(.caption.weight(.medium))
                             TextEditor(text: $draft.vocabulary).font(.callout).frame(height: 65)
@@ -223,11 +228,16 @@ struct SpeechRecognitionEnginePicker: View {
             Spacer()
             Picker("识别方式", selection: effectiveSelection) {
                 Text("本地 Whisper").tag(SpeechRecognitionEngine.whisper)
-                Text("Apple 语音识别").tag(SpeechRecognitionEngine.apple)
+                Text(AppleSpeechAvailability.usesAnalyzer ? "Apple 本地识别" : "Apple 语音识别")
+                    .tag(SpeechRecognitionEngine.apple)
             }
             .labelsHidden().frame(width: 200)
             .disabled(isLocked || speechLocale == "zh-en")
-            .help(speechLocale == "zh-en" ? "中英混合使用本地 Whisper，在中文和英文之间识别。" : "本地 Whisper 无需开启 Siri／听写。")
+            .help(speechLocale == "zh-en"
+                  ? "中英混合使用本地 Whisper，在中文和英文之间识别。"
+                  : (AppleSpeechAvailability.usesAnalyzer
+                     ? "Apple 本地识别无需开启 Siri／听写；首次使用可能需要准备语言资源。"
+                     : "旧版 Apple 识别需要开启系统听写；本地 Whisper 无此依赖。"))
         }
     }
 }

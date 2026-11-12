@@ -11,7 +11,7 @@
 | 功能 | 当前实现 |
 |---|---|
 | 录音来源 | 麦克风、系统声音、同时录制；系统音包含 Zoom、飞书等软件播放的声音 |
-| 实时转写 | 默认使用本地 WhisperKit；English 固定英文，中英混合在中文／英文之间检测；单语可选 Apple Speech |
+| 实时转写 | 默认本地 WhisperKit；中英混合在中文／英文之间检测；单语可选 Apple，macOS 26 使用新的本地 SpeechAnalyzer |
 | 实时翻译 | Bedrock 文字模型；Whisper 当前句先增补，句末／停顿／有界长句后发送，Apple 使用文字稳定策略；原文修订立即撤下旧译文 |
 | 实时字幕 | 会议直接在主窗口中记录；每段原文在上、金色译文在下，统一滚动，可跟随最新或暂停回看 |
 | 译文与操作状态 | 翻译页可读已有全文或有效逐段译文；全文操作暂停时显示原因与下一步，只读原文保持清晰 |
@@ -44,7 +44,7 @@ App 自动按型号适配：Sonnet 使用 Converse 的 `between_tools` 与低 ef
 
 ## 在 Mac 上构建
 
-需要 macOS 14+、Swift 5.10+ 和已完成首次初始化的完整 Xcode，建议 Xcode 16 或更新版本。Core 测试需要 Xcode 提供的 XCTest，仅安装 Command Line Tools 不够。首次构建会从 GitHub 下载精确版本 `1.1.1` 的 WhisperKit 和它的依赖。
+需要 macOS 14+、Swift 5.10+ 和已完成首次初始化的完整 Xcode。要编译新的 Apple 本地识别分支，使用 Xcode 26+、Swift 6.2+ 和 macOS 26 SDK；交付 CI 会检查这一条件。Core 测试需要 Xcode 提供的 XCTest，仅安装 Command Line Tools 不够。首次构建会从 GitHub 下载精确版本 `1.1.1` 的 WhisperKit 和它的依赖。
 
 仓库为 private，需要当前 GitHub 账号有访问权限。登录 GitHub 后取得源码：
 
@@ -100,7 +100,7 @@ bash scripts/build-mac.sh --open
 
 - key：macOS Keychain，service `app.hearnote.mac.bedrock`。
 
-- 首次启动默认“中英混合”与本地 Whisper，旧设置没有识别方式字段时也默认 Whisper。English 使用同一模型并固定英文；混合模式限制候选为中文／英文。选择识别语言不改变翻译方向。Apple Speech 保留为单语可选方式，需相应权限和可用系统识别服务；联网识别由用户明确开启。
+- 首次启动默认“中英混合”与本地 Whisper，旧设置没有识别方式字段时也默认 Whisper。English 使用同一模型并固定英文；混合模式限制候选为中文／英文。选择识别语言不改变翻译方向。单语可选 [Apple 本地识别](docs/Apple本地识别.md)：macOS 26 的新接口无需开启 Siri／听写，首次可能下载 Apple 系统语言资源；旧系统保留原接口及明确选择的联网选项。
 
 - 本地 Whisper 使用 WhisperKit 1.1.1／Core ML，默认 Large v3 Turbo，亦可选 Small；会议状态显示实际加载型号。字幕按词时间戳、句末标点和停顿组句，当前未完句持续补全，跨解码窗口保留。没有句界的长发言有长度上限，避免译文一直等待；不会调用大模型改写原文。旧笔记保留原分段，需用户主动重新转写后才应用新逻辑。
 

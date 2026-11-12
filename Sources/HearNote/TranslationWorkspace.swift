@@ -68,7 +68,9 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
     private var translationID: UUID?
     private var voiceTask: Task<Void, Never>?
     private var voiceID: UUID?
-    private var recognizer: WhisperLiveRecognizer?
+    private var whisperRecognizer: WhisperLiveRecognizer?
+    private var appleRecognizer: LiveSpeechRecognizer?
+    private var voiceBackendDescription = ""
     private var voiceSegments: [UUID: TranscriptSegment] = [:]
     private var voiceRecognitionFailed = false
     private var engine: AVAudioEngine?
@@ -310,43 +312,84 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
         let id = UUID()
         voiceID = id
         isPreparing = true
-        status = "正在准备本地语音识别…"
         let modelVariant = state.preferences.whisperModel
         let terms = state.preferences.contextualStrings
-        let speechLocale = Self.localeForLanguage(source) ?? "auto"
-        let liveRecognizer = state.mixedSpeech.makeLiveRecognizer()
-        recognizer = liveRecognizer
-        liveRecognizer.onError = { [weak self] error in
-            self?.voiceFailed(error, id: id)
+        let speechLocale = Self.localeForLanguage(source)
+        // 独立翻译按这里明确选择的原文语言识别，不使用会议的中英混合配置覆盖它。
+        let useApple = state.preferences.speechEngine == .apple && speechLocale != nil
+        let allowCloudRecognition = state.preferences.allowCloudRecognition
+        let apple = useApple ? LiveSpeechRecognizer() : nil
+        let whisper = useApple ? nil : state.mixedSpeech.makeLiveRecognizer()
+        appleRecognizer = apple
+        whisperRecognizer = whisper
+        if let apple {
+            voiceBackendDescription = apple.backendDescription
+            apple.onError = { [weak self] error in self?.voiceFailed(error, id: id) }
+            apple.onStatusChange = { [weak self, weak apple] recognitionStatus in
+                guard let self, let apple, self.voiceID == id,
+                      !self.voiceRecognitionFailed else { return }
+                self.voiceBackendDescription = apple.backendDescription
+                let backendPrefix = "\(apple.backendDescription) · "
+                self.status = recognitionStatus.hasPrefix(backendPrefix)
+                    ? recognitionStatus : backendPrefix + recognitionStatus
+            }
+        } else if let whisper {
+            switch modelVariant {
+            case WhisperSpeechService.defaultModelVariant:
+                voiceBackendDescription = "本地 Whisper Large v3 Turbo"
+            case "small":
+                voiceBackendDescription = "本地 Whisper Small"
+            default:
+                voiceBackendDescription = "本地 Whisper"
+            }
+            whisper.onError = { [weak self] error in self?.voiceFailed(error, id: id) }
+        }
+        status = "\(voiceBackendDescription) · 正在准备语音识别…"
+        let update: (TranscriptSegment, Bool) -> Void = { [weak self] segment, _ in
+            guard let self, self.voiceID == id else { return }
+            if segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.voiceSegments.removeValue(forKey: segment.id)
+            } else {
+                self.voiceSegments[segment.id] = segment
+            }
+            self.updateFields { self.inputText = self.recognizedText }
         }
         voiceTask = Task { [weak self, weak state] in
             do {
                 try await Self.authorizeMicrophone()
                 try Task.checkCancellation()
                 guard let self, let state, self.voiceID == id else { return }
-                try await state.mixedSpeech.prepare(modelVariant: modelVariant)
+                if let apple, let speechLocale {
+                    try await apple.start(
+                        locale: speechLocale, allowCloudRecognition: allowCloudRecognition,
+                        contextualStrings: terms, source: "语音翻译", onUpdate: update
+                    )
+                    self.voiceBackendDescription = apple.backendDescription
+                } else if let whisper {
+                    try await state.mixedSpeech.prepare(modelVariant: modelVariant)
+                    try Task.checkCancellation()
+                    guard self.voiceID == id, !state.isQuitting,
+                          !state.recorder.isRecording, !state.isBusy else {
+                        throw CancellationError()
+                    }
+                    try await whisper.start(
+                        contextualStrings: terms, source: "语音翻译",
+                        locale: speechLocale ?? "auto", onUpdate: update
+                    )
+                }
                 try Task.checkCancellation()
                 guard self.voiceID == id, !state.isQuitting,
                       !state.recorder.isRecording, !state.isBusy else {
                     throw CancellationError()
                 }
-                try await liveRecognizer.start(contextualStrings: terms, source: "语音翻译", locale: speechLocale) {
-                    [weak self] segment, _ in
-                    guard let self, self.voiceID == id else { return }
-                    if segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        self.voiceSegments.removeValue(forKey: segment.id)
-                    } else {
-                        self.voiceSegments[segment.id] = segment
-                    }
-                    self.updateFields { self.inputText = self.recognizedText }
+                try self.startMicrophone(id: id) { [weak apple, weak whisper] buffer in
+                    if let apple { apple.append(buffer) }
+                    else { whisper?.append(buffer) }
                 }
-                try Task.checkCancellation()
-                guard self.voiceID == id else { throw CancellationError() }
-                try self.startMicrophone(id: id, recognizer: liveRecognizer)
                 self.isPreparing = false
                 self.isListening = true
                 self.voiceTask = nil
-                self.status = "正在聆听，说完后点击“结束并翻译”"
+                self.status = "\(self.voiceBackendDescription) · 正在聆听，说完后点击“结束并翻译”"
             } catch is CancellationError {
                 guard let self, self.voiceID == id else { return }
                 self.cancelVoice()
@@ -358,23 +401,31 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
     }
 
     func stopVoiceAndTranslate() {
-        guard isListening, let id = voiceID, let recognizer else { return }
+        guard isListening, let id = voiceID,
+              whisperRecognizer != nil || appleRecognizer != nil else { return }
+        let whisper = whisperRecognizer
+        let apple = appleRecognizer
         isListening = false
         isFinishingVoice = true
         stopMicrophone()
-        status = "正在识别最后一句…"
+        status = "\(voiceBackendDescription) · 正在识别最后一句…"
         voiceTask = Task { [weak self] in
             // tap 的 PCM 副本在主队列投递；停止引擎后用队列屏障先收完已排队的最后一批。
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 DispatchQueue.main.async { continuation.resume() }
             }
             guard let self, self.voiceID == id, !Task.isCancelled else { return }
-            await recognizer.finish()
+            if let apple { await apple.finish() }
+            else { await whisper?.finish() }
             guard self.voiceID == id, !Task.isCancelled else { return }
             self.updateFields { self.inputText = self.recognizedText }
             let failed = self.voiceRecognitionFailed
             self.voiceID = nil
-            self.recognizer = nil
+            whisper?.onError = nil
+            apple?.onError = nil
+            apple?.onStatusChange = nil
+            self.whisperRecognizer = nil
+            self.appleRecognizer = nil
             self.voiceTask = nil
             self.isFinishingVoice = false
             self.isPreparing = false
@@ -397,9 +448,14 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
         voiceTask?.cancel()
         voiceTask = nil
         stopMicrophone()
-        recognizer?.onError = nil
-        recognizer?.cancel()
-        recognizer = nil
+        whisperRecognizer?.onError = nil
+        whisperRecognizer?.cancel()
+        whisperRecognizer = nil
+        appleRecognizer?.onError = nil
+        appleRecognizer?.onStatusChange = nil
+        appleRecognizer?.cancel()
+        appleRecognizer = nil
+        voiceBackendDescription = ""
         isListening = false
         isPreparing = false
         isFinishingVoice = false
@@ -635,19 +691,21 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
         }
     }
 
-    private func startMicrophone(id: UUID, recognizer: WhisperLiveRecognizer) throws {
+    private func startMicrophone(
+        id: UUID, append: @escaping @MainActor (AVAudioPCMBuffer) -> Void
+    ) throws {
         let newEngine = AVAudioEngine()
         let input = newEngine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw TranslationWorkspaceIssue("当前麦克风不可用，请检查输入设备。")
         }
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self, weak recognizer] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
             guard let copied = TranslationAudioBuffer.copy(buffer) else { return }
             DispatchQueue.main.async {
-                guard let self, let recognizer, self.voiceID == id,
+                guard let self, self.voiceID == id,
                       self.isListening || self.isFinishingVoice else { return }
-                recognizer.append(copied)
+                append(copied)
             }
         }
         engine = newEngine

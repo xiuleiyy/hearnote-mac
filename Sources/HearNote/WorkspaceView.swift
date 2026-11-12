@@ -577,6 +577,9 @@ struct RecordingView: View {
                             state.translationWorkspace.isUsingSpeech
                     }
                 )
+            } else if AppleSpeechAvailability.usesAnalyzer {
+                Text("Apple 本地识别无需开启 Siri／听写。首次使用可能需要准备语言资源；录音会先开始，识别就绪后接收新声音。")
+                    .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
             }
             VStack(alignment: .leading, spacing: 10) {
                 Label("每段原文在上、译文在下，逐段实时对照", systemImage: "text.alignleft")
@@ -599,7 +602,7 @@ struct RecordingView: View {
                                     WhisperPreparationStatusView(service: state.mixedSpeech)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 } else {
-                                    Text("正在准备 Apple 语音识别…")
+                                    Text(state.liveRecognitionStatus)
                                         .font(.caption).foregroundStyle(.secondary)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
@@ -611,7 +614,7 @@ struct RecordingView: View {
                         }
                     }
                     Text(state.liveRecognitionStatus.isEmpty ? "等待识别状态…" : state.liveRecognitionStatus)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(4)
                         .help(state.liveRecognitionStatus)
                     if !state.liveRecognitionWarning.isEmpty {
                         Text(state.liveRecognitionWarning).font(.caption).foregroundStyle(.orange)

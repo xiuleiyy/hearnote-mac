@@ -16,6 +16,15 @@ hearnote_short_commit="${hearnote_commit:0:8}"
     xcrun --sdk macosx --show-sdk-version
 } > dist/ci/build-environment.txt
 
+# 交付包必须实际编译 macOS 26 的 SpeechAnalyzer 分支，不能悄悄省略新识别实现。
+hearnote_swift_version="$(swift --version)"
+if [[ ! "$hearnote_swift_version" =~ Swift\ version\ ([0-9]+)\.([0-9]+) ]] ||
+   (( BASH_REMATCH[1] < 6 || (BASH_REMATCH[1] == 6 && BASH_REMATCH[2] < 2) )); then
+    echo "本次交付需要 Swift 6.2+ 和 macOS 26 SDK，请选择 Xcode 26 或更新版本。" \
+        > dist/ci/结果说明.md
+    exit 1
+fi
+
 # 不记录环境变量、凭据或客户数据。所有测试只使用合成数据和 URLProtocol stub。
 if ! bash scripts/build-mac.sh 2>&1 | tee dist/ci/build.log; then
     echo "macOS 构建失败；没有生成经验证的安装包。" > dist/ci/结果说明.md
@@ -58,7 +67,7 @@ git diff "$hearnote_feedback_base" HEAD -- Sources/ Tests/ scripts/ Resources/ P
     echo "- 签名：本机 ad-hoc；没有 Developer ID 签名或公证。"
     echo "- 完整 Core XCTest、release 编译、签名与架构检查：通过，数量见 build.log。"
     echo "- App 移动后独立启动检查、DMG 校验及只读挂载检查：通过，详见 verify.log。"
-    echo "- 麦克风、系统音、Whisper 推理、翻译、北京网络速度及 GUI 功能：未测。"
+    echo "- 麦克风、系统音、Apple／Whisper 推理、翻译、北京网络速度及 GUI 功能：未测。"
     echo "- 未使用客户 Bedrock API Key；不是 Mac 实机功能验收完成。"
     echo
     echo "build-environment.txt 记录实际 macOS、Xcode、Swift 与 SDK；源码 ZIP 包含本次解析的 Package.resolved。"

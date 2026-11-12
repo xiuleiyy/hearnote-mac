@@ -415,7 +415,11 @@ final class AppState: ObservableObject {
         transcriber.contextualStrings = preferences.contextualStrings
         busyMessage = "正在转写，原文件保留在本机…"
         workTask = Task {
-            defer { workTask = nil; busyMessage = nil }
+            defer {
+                transcriber.onStatusChange = nil
+                workTask = nil
+                busyMessage = nil
+            }
             do {
                 let segments: [TranscriptSegment]
                 if usesWhisper {
@@ -424,6 +428,10 @@ final class AppState: ObservableObject {
                         contextualStrings: vocabulary, modelVariant: modelVariant, locale: locale
                     )
                 } else {
+                    transcriber.onStatusChange = { [weak self] status in
+                        guard !Task.isCancelled else { return }
+                        self?.busyMessage = status
+                    }
                     segments = try await transcriber.transcribe(
                         url: repository.mediaURL(filename: filename), locale: locale,
                         allowCloudRecognition: allowCloud
@@ -632,7 +640,8 @@ final class AppState: ObservableObject {
             refreshRecognitionStatus()
         } catch is CancellationError {
             if meetingRecognitionID == id, recorder.isRecording {
-                liveRecognitionStatus = "识别准备已取消 · 录音继续保存，可在会后重新转写。"
+                refreshRecognitionStatus()
+                liveRecognitionStatus += "\n未完成的识别准备已取消 · 录音继续保存"
             }
         } catch {
             recordRecognitionWarning(error, source: "识别模型", meetingID: id)
@@ -658,13 +667,22 @@ final class AppState: ObservableObject {
         systemSpeech.onError = { [weak self] error in
             self?.recordRecognitionWarning(error, source: "会议声音", meetingID: meetingID)
         }
+        microphoneSpeech.onStatusChange = { [weak self] _ in
+            guard let self, self.meetingRecognitionID == meetingID else { return }
+            self.refreshRecognitionStatus()
+        }
+        systemSpeech.onStatusChange = { [weak self] _ in
+            guard let self, self.meetingRecognitionID == meetingID else { return }
+            self.refreshRecognitionStatus()
+        }
     }
 
     private func recordRecognitionWarning(_ error: Error, source: String, meetingID: UUID) {
         guard liveDocumentID == meetingID else { return }
         let detail: String
-        if error.localizedDescription.localizedCaseInsensitiveContains("Siri and Dictation are disabled") {
-            detail = "Apple 语音识别被系统禁用（Siri／听写未开启）。可结束保存后，在识别方式中选择本地 Whisper，再重新转写。"
+        if !AppleSpeechAvailability.usesAnalyzer,
+           error.localizedDescription.localizedCaseInsensitiveContains("Siri and Dictation are disabled") {
+            detail = "旧版 Apple 识别被系统停用。请在系统设置中开启“听写”后重新开始识别；也可结束保存后用本地 Whisper 重新转写。"
         } else { detail = error.localizedDescription }
         recognitionWarnings[source] = "\(source)：\(detail)"
         liveRecognitionWarning = "录音继续保存在本机。\n" + recognitionWarnings.keys.sorted()
@@ -674,6 +692,17 @@ final class AppState: ObservableObject {
 
     private func refreshRecognitionStatus() {
         guard recorder.isRecording, !isStoppingRecording else { return }
+        if !meetingUsesWhisper {
+            var statuses: [String] = []
+            if recorder.source.includesMicrophone {
+                statuses.append("麦克风：\(microphoneSpeech.recognitionStatus)")
+            }
+            if recorder.source.includesSystem {
+                statuses.append("会议声音：\(systemSpeech.recognitionStatus)")
+            }
+            liveRecognitionStatus = statuses.joined(separator: "\n")
+            return
+        }
         let microphoneActive = meetingUsesWhisper ? microphoneMixedSpeech.isRecognizing : microphoneSpeech.isRecognizing
         let systemActive = meetingUsesWhisper ? systemMixedSpeech.isRecognizing : systemSpeech.isRecognizing
         if microphoneActive || systemActive {
@@ -683,7 +712,11 @@ final class AppState: ObservableObject {
         }
     }
     private var meetingRecognitionDescription: String {
-        guard meetingUsesWhisper else { return "Apple 语音识别" }
+        guard meetingUsesWhisper else {
+            return recorder.source.includesSystem
+                ? systemSpeech.backendDescription + " "
+                : microphoneSpeech.backendDescription + " "
+        }
         switch mixedSpeech.loadedModelVariant {
         case WhisperSpeechService.defaultModelVariant: return "本地 Whisper Large v3 Turbo "
         case "small": return "本地 Whisper Small "
@@ -694,8 +727,8 @@ final class AppState: ObservableObject {
         guard isPreparingMeetingRecognition else { return }
         meetingRecognitionTask?.cancel()
         if meetingUsesWhisper { mixedSpeech.cancelPreparation() }
-        isPreparingMeetingRecognition = false
-        liveRecognitionStatus = "识别准备已取消 · 录音继续保存，可在会后重新转写。"
+        // 等准备任务实际退出再清状态；已经就绪的另一路识别继续工作。
+        liveRecognitionStatus = "正在取消识别准备 · 录音继续保存"
     }
     private func receiveLiveSegment(_ segment: TranscriptSegment, final: Bool) {
         guard let id = liveDocumentID, let index = documents.firstIndex(where: { $0.id == id }) else { return }
@@ -707,7 +740,9 @@ final class AppState: ObservableObject {
             return
         }
         let status = "\(meetingRecognitionDescription)正在转写 · 原文和录音保存在本机"
-        if recorder.isRecording, liveRecognitionStatus != status {
+        if !meetingUsesWhisper {
+            refreshRecognitionStatus()
+        } else if recorder.isRecording, liveRecognitionStatus != status {
             liveRecognitionStatus = status
         }
         if let existing = documents[index].segments.firstIndex(where: { $0.id == segment.id }) {

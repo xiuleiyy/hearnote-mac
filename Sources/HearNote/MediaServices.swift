@@ -5,6 +5,15 @@ import Foundation
 import HearNoteCore
 import Speech
 
+enum AppleSpeechAvailability {
+    static var usesAnalyzer: Bool {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) { return true }
+        #endif
+        return false
+    }
+}
+
 enum MediaServiceError: LocalizedError {
     case microphonePermission
     case speechPermission
@@ -456,11 +465,14 @@ final class SpeechTranscriber: ObservableObject {
     @Published private(set) var progress: Double = 0
     /// 识别失败或取消时，不让已经完成的前半段文字消失。
     @Published private(set) var partialSegments: [TranscriptSegment] = []
+    @Published private(set) var recognitionStatus = ""
+    var onStatusChange: ((String) -> Void)?
     var contextualStrings: [String] = []
 
     private var runID: UUID?
     private var activeRecognition: FileRecognitionOperation?
     private var activeExport: AudioExportOperation?
+    private var activeNativeRecognition: LiveSpeechRecognizer?
 
     func transcribe(url: URL, locale: String, allowCloudRecognition: Bool,
                     contextualStrings: [String]? = nil) async throws -> [TranscriptSegment] {
@@ -473,9 +485,12 @@ final class SpeechTranscriber: ObservableObject {
         isTranscribing = true
         progress = 0
         partialSegments = []
+        setStatus("正在读取录音…")
         defer {
             if runID == id {
                 runID = nil
+                activeNativeRecognition?.cancel()
+                activeNativeRecognition = nil
                 activeRecognition = nil
                 activeExport = nil
                 isTranscribing = false
@@ -495,11 +510,19 @@ final class SpeechTranscriber: ObservableObject {
 
     func cancel() {
         runID = nil
+        activeNativeRecognition?.cancel()
         activeRecognition?.cancel()
         activeExport?.cancel()
         activeRecognition = nil
+        activeNativeRecognition = nil
         activeExport = nil
         isTranscribing = false
+    }
+
+    private func setStatus(_ status: String) {
+        guard recognitionStatus != status else { return }
+        recognitionStatus = status
+        onStatusChange?(status)
     }
 
     private func checkRun(_ id: UUID) throws {
@@ -510,6 +533,14 @@ final class SpeechTranscriber: ObservableObject {
     private func performTranscription(url: URL, locale: String, allowCloudRecognition: Bool,
                                       contextualStrings: [String], id: UUID) async throws
         -> [TranscriptSegment] {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            return try await performNativeTranscription(
+                url: url, locale: locale, contextualStrings: contextualStrings, id: id
+            )
+        }
+        #endif
+        // 仅旧系统使用 SFSpeechRecognizer 授权；新接口不受 Siri／听写开关限制。
         let recognizer = try await SpeechPermissions.recognizer(
             locale: locale, allowCloudRecognition: allowCloudRecognition
         )
@@ -568,6 +599,103 @@ final class SpeechTranscriber: ObservableObject {
         progress = 1
         return partialSegments
     }
+
+    #if compiler(>=6.2)
+    @available(macOS 26.0, *)
+    private func performNativeTranscription(
+        url: URL, locale: String, contextualStrings: [String], id: UUID
+    ) async throws -> [TranscriptSegment] {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hearnote-apple-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file: AVAudioFile
+        do {
+            // 音频文件直接解码为 PCM，避免再次压缩以及按固定秒数切断语句。
+            file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
+        } catch {
+            try checkRun(id)
+            let asset = AVURLAsset(url: url)
+            guard !(try await asset.loadTracks(withMediaType: .audio)).isEmpty else {
+                throw MediaServiceError.noAudio
+            }
+            let duration = try await asset.load(.duration).seconds
+            guard duration.isFinite, duration > 0 else { throw MediaServiceError.invalidDuration }
+            try checkRun(id)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let audioURL = directory.appendingPathComponent("audio.m4a")
+            guard let exporter = AVAssetExportSession(
+                asset: asset, presetName: AVAssetExportPresetAppleM4A
+            ) else { throw MediaServiceError.exportFailed("此文件无法读取为识别用音频。") }
+            exporter.outputURL = audioURL
+            exporter.outputFileType = .m4a
+            let operation = AudioExportOperation(
+                session: exporter, timeoutSeconds: max(180, min(3600, duration)),
+                action: "提取完整音轨"
+            )
+            activeExport = operation
+            setStatus("正在提取视频音轨，原文件保留…")
+            try await operation.run()
+            activeExport = nil
+            try checkRun(id)
+            file = try AVAudioFile(forReading: audioURL, commonFormat: .pcmFormatFloat32, interleaved: false)
+        }
+        try checkRun(id)
+        guard file.length > 0, file.processingFormat.sampleRate > 0 else {
+            throw MediaServiceError.invalidDuration
+        }
+        let native = LiveSpeechRecognizer()
+        activeNativeRecognition = native
+        native.onStatusChange = { [weak self] status in
+            guard let self, self.runID == id else { return }
+            self.setStatus(status)
+        }
+        try await native.start(
+            locale: locale, allowCloudRecognition: false, contextualStrings: contextualStrings,
+            source: "录音", onUpdate: { [weak self] segment, _ in
+                guard let self, self.runID == id else { return }
+                if segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.partialSegments.removeAll { $0.id == segment.id }
+                } else if let index = self.partialSegments.firstIndex(where: { $0.id == segment.id }) {
+                    self.partialSegments[index] = segment
+                } else {
+                    self.partialSegments.append(segment)
+                }
+                self.partialSegments.sort { $0.start < $1.start }
+            }
+        )
+        // 小块输入按 analyzer 消费速度等待，内存不随录音时长增长。
+        while file.framePosition < file.length {
+            try checkRun(id)
+            let offset = Double(file.framePosition) / file.processingFormat.sampleRate
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 8192) else {
+                throw MediaServiceError.recognitionFailed("无法分配识别音频缓冲区。")
+            }
+            try file.read(into: buffer, frameCount: 8192)
+            guard buffer.frameLength > 0 else { break }
+            try await native.appendForTranscription(buffer, at: offset)
+            try checkRun(id)
+            let fedProgress = min(0.99, Double(file.framePosition) / Double(file.length))
+            if Int(fedProgress * 100) != Int(progress * 100) {
+                progress = fedProgress
+                setStatus("\(native.backendDescription)正在转写 \(Int(progress * 100))% · 原文件保留")
+            }
+            await Task.yield()
+        }
+        try checkRun(id)
+        setStatus("正在定稿最后一段…")
+        await native.finish(timeout: 120)
+        try checkRun(id)
+        if let error = native.errorMessage {
+            throw MediaServiceError.recognitionFailed(error)
+        }
+        guard !partialSegments.isEmpty else {
+            throw MediaServiceError.recognitionFailed("没有识别到文字。请检查录音和所选语种；已有原文保留。")
+        }
+        progress = 1
+        setStatus("转写完成")
+        return partialSegments
+    }
+    #endif
 }
 
 @MainActor
@@ -604,8 +732,15 @@ private final class AudioExportOperation {
     private var deadline: Task<Void, Never>?
     private var completed = false
     private var cancelled = false
+    private let timeoutNanoseconds: UInt64
+    private let action: String
 
-    init(session: AVAssetExportSession) { self.session = session }
+    init(session: AVAssetExportSession, timeoutSeconds: Double = 90, action: String = "音频分段") {
+        self.session = session
+        self.action = action
+        timeoutNanoseconds = UInt64(max(1, min(3600, timeoutSeconds.isFinite ? timeoutSeconds : 90))
+                                   * 1_000_000_000)
+    }
 
     func run() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -626,12 +761,13 @@ private final class AudioExportOperation {
                     }
                 }
             }
+            let timeout = timeoutNanoseconds
             deadline = Task { [weak self] in
-                do { try await Task.sleep(nanoseconds: 90_000_000_000) }
+                do { try await Task.sleep(nanoseconds: timeout) }
                 catch { return }
                 guard let self, !self.completed else { return }
                 self.session.cancelExport()
-                self.finish(error: MediaServiceError.timedOut("音频分段"))
+                self.finish(error: MediaServiceError.timedOut(self.action))
             }
         }
     }

@@ -9,12 +9,20 @@ import Speech
 final class LiveSpeechRecognizer: ObservableObject {
     @Published private(set) var isRecognizing = false
     @Published private(set) var errorMessage: String?
-    @Published private(set) var recognitionStatus = "已停止"
+    @Published private(set) var recognitionStatus = "已停止" {
+        didSet {
+            if oldValue != recognitionStatus { onStatusChange?(recognitionStatus) }
+        }
+    }
+    @Published private(set) var backendDescription = "Apple SFSpeechRecognizer"
 
     /// 双输入源由调用方设置同一会议起点，保证时间戳在同一条时间轴上。
     var timelineOrigin: Date?
     var onError: ((Error) -> Void)?
+    var onStatusChange: ((String) -> Void)?
 
+    private var analyzerService: (any AppleSpeechStreamingService)?
+    private var analyzerPreparation: AppleSpeechStartOperation?
     private var recognizer: SFSpeechRecognizer?
     private var configuration: Configuration?
     private var sessionID: UUID?
@@ -40,6 +48,43 @@ final class LiveSpeechRecognizer: ObservableObject {
         errorMessage = nil
         recognitionStatus = "正在检查语音识别…"
         do {
+            #if compiler(>=6.2)
+            if #available(macOS 26.0, *) {
+                let service = AppleAnalyzerSpeechService()
+                analyzerService = service
+                backendDescription = service.backendDescription
+                // 新 API 的本机识别及模型资源独立于旧 Siri／听写授权。
+                // macOS26 的失败明确上报，不暗退到旧授权路径或网络识别。
+                let preparation = AppleSpeechStartOperation(onCancel: { [weak service] in
+                    service?.cancel()
+                })
+                analyzerPreparation = preparation
+                try await preparation.run {
+                    try await service.start(
+                        locale: locale, contextualStrings: contextualStrings, source: source,
+                        origin: self.timelineOrigin ?? Date(), onUpdate: { [weak self] segment, final in
+                            guard let self, self.sessionID == id else { return }
+                            onUpdate(segment, final)
+                        }, onState: { [weak self, weak service] status, ready in
+                            guard let self, self.sessionID == id else { return }
+                            self.backendDescription = service?.backendDescription ?? self.backendDescription
+                            self.isRecognizing = ready
+                            self.recognitionStatus = status
+                        }, onError: { [weak self] error in
+                            guard let self, self.sessionID == id else { return }
+                            self.errorMessage = error.localizedDescription
+                            self.isRecognizing = false
+                            self.onError?(error)
+                        }
+                    )
+                }
+                if analyzerPreparation === preparation { analyzerPreparation = nil }
+                try Task.checkCancellation()
+                guard sessionID == id else { throw CancellationError() }
+                return
+            }
+            #endif
+            backendDescription = "Apple SFSpeechRecognizer"
             let resolvedRecognizer = try await SpeechPermissions.recognizer(
                 locale: locale, allowCloudRecognition: allowCloudRecognition
             )
@@ -58,6 +103,9 @@ final class LiveSpeechRecognizer: ObservableObject {
             // 捕获权限尚未完成时可能还没有 PCM；先不创建无输入的 Speech request。
         } catch {
             if sessionID == id {
+                analyzerPreparation?.cancel()
+                analyzerPreparation = nil
+                analyzerService?.cancel()
                 sessionID = nil
                 isRecognizing = false
                 recognitionStatus = error is CancellationError ? "已停止" : "识别未就绪"
@@ -69,6 +117,10 @@ final class LiveSpeechRecognizer: ObservableObject {
 
     /// buffer 必须是独立副本；不能将 AudioEngine tap 会复用的原 buffer 留在异步队列。
     func append(_ buffer: AVAudioPCMBuffer, at timelineOffset: Double? = nil) {
+        if let analyzerService {
+            analyzerService.append(buffer, at: timelineOffset)
+            return
+        }
         guard isRecognizing, let sessionID,
               buffer.frameLength > 0, buffer.format.sampleRate.isFinite,
               buffer.format.sampleRate > 0 else { return }
@@ -98,6 +150,19 @@ final class LiveSpeechRecognizer: ObservableObject {
         if recognitionStatus != "识别中" { recognitionStatus = "识别中" }
     }
 
+    /// 文件识别按 analyzer 消费速度读取，保持有界 PCM 内存；实时采集仍使用 append。
+    func appendForTranscription(_ buffer: AVAudioPCMBuffer, at timelineOffset: Double) async throws {
+        try Task.checkCancellation()
+        if let analyzerService {
+            try await analyzerService.appendForTranscription(buffer, at: timelineOffset)
+        } else {
+            guard isRecognizing else {
+                throw AppIssue(errorMessage ?? "Apple 语音识别尚未就绪。")
+            }
+            append(buffer, at: timelineOffset)
+        }
+    }
+
     private func appendSilence(seconds: Double, format: AVAudioFormat, to stream: RecognitionStream) {
         var remaining = AVAudioFrameCount(seconds * format.sampleRate)
         while remaining > 0 {
@@ -118,6 +183,11 @@ final class LiveSpeechRecognizer: ObservableObject {
 
     /// 停止接收输入，允许 Speech 返回最后一句的最终结果。
     func stop() {
+        if let analyzerService {
+            analyzerService.stop()
+            isRecognizing = false
+            return
+        }
         isRecognizing = false
         rotationTask?.cancel()
         rotationTask = nil
@@ -127,8 +197,14 @@ final class LiveSpeechRecognizer: ObservableObject {
         resolveFinishWaitersIfNeeded()
     }
 
-    /// 保存会议前可 await，此过程最长等待每个最后请求的15秒截止时间。
-    func finish() async {
+    /// 直播默认等待20秒；文件转写可传更长有界期限，旧请求仍按各自15秒截止时间。
+    func finish(timeout: TimeInterval = 20) async {
+        let finishingSession = sessionID
+        if let analyzerService {
+            await analyzerService.finish(timeout: timeout)
+            if sessionID == finishingSession { isRecognizing = false }
+            return
+        }
         stop()
         guard !streams.isEmpty else { return }
         await withTaskCancellationHandler {
@@ -137,13 +213,20 @@ final class LiveSpeechRecognizer: ObservableObject {
                 else { finishWaiters.append(continuation) }
             }
         } onCancel: {
-            Task { @MainActor [weak self] in self?.cancel() }
+            Task { @MainActor [weak self] in
+                guard self?.sessionID == finishingSession else { return }
+                self?.cancel()
+            }
         }
     }
 
     /// 明确丢弃本次识别的后续回调，已有文本由外部文档持有。
     func cancel() {
         sessionID = nil
+        analyzerPreparation?.cancel()
+        analyzerPreparation = nil
+        analyzerService?.cancel()
+        analyzerService = nil
         isRecognizing = false
         rotationTask?.cancel()
         rotationTask = nil
