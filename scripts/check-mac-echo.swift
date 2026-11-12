@@ -14,17 +14,35 @@ private func diagnostic(_ message: String) {
     FileHandle.standardError.write(Data("[Mac echo check] \(message)\n".utf8))
 }
 
+/// Synthetic scheduling uses a logical monotonic clock. Advancing it is not a
+/// measurement of the user's capture latency or of this CI machine's speed.
+private final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0.0
+
+    func now() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance(to next: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        precondition(next.isFinite && next >= value)
+        value = next
+    }
+}
+
 @MainActor
 private final class Collector {
     var samples: [Float] = []
     var starts: [Double] = []
     var statuses: [String] = []
-    var deliveries: [(samples: Int, at: Double)] = []
     func append(_ buffer: AVAudioPCMBuffer, at hostTime: Double) {
         starts.append(hostTime)
         if let data = buffer.floatChannelData?[0] {
             samples.append(contentsOf: UnsafeBufferPointer(start: data, count: Int(buffer.frameLength)))
-            deliveries.append((samples.count, ProcessInfo.processInfo.systemUptime))
         }
     }
 }
@@ -74,13 +92,15 @@ struct MacEchoHarness {
     }
 
     @MainActor
-    private static func processor(name: String, root: URL, epoch: Double, collector: Collector) throws -> MeetingEchoProcessor {
+    private static func processor(name: String, root: URL, epoch: Double, collector: Collector,
+                                  clock: TestClock? = nil) throws -> MeetingEchoProcessor {
         let directory = root.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return try MeetingEchoProcessor(
             directory: directory, epoch: epoch,
             onOutput: { pcm, time in collector.append(pcm, at: time) },
-            onStatus: { collector.statuses.append($0) }
+            onStatus: { collector.statuses.append($0) },
+            monotonicNow: { clock?.now() ?? ProcessInfo.processInfo.systemUptime }
         )
     }
 
@@ -164,20 +184,32 @@ struct MacEchoHarness {
     @MainActor
     static func lateReference(captureAge: Double, root: URL) async throws {
         let collector = Collector()
+        let clock = TestClock()
+        let realStart = ProcessInfo.processInfo.systemUptime
         let epoch = hostNow() - captureAge
         let name = captureAge > 0 ? "late-capture-late-reference" : "late-reference"
-        let processor = try processor(name: name, root: root, epoch: epoch, collector: collector)
-        let pcm = try buffer(rate: 16_000, start: 0, count: 320) {
+        let processor = try processor(name: name, root: root, epoch: epoch, collector: collector, clock: clock)
+        // More than one processing frame ensures this tests waiting even when
+        // AVAudioConverter retains a small tail until EOS.
+        let expected = 640
+        let pcm = try buffer(rate: 16_000, start: 0, count: expected) {
             Float(0.1 * sin(2 * .pi * 400 * $0))
         }
         processor.appendMicrophone(pcm, hostTime: epoch)
-        // Leave scheduling margin below the real-time 180ms fallback deadline.
-        try await Task.sleep(nanoseconds: 80_000_000)
-        try require(collector.samples.isEmpty, "\(name): capture age consumed the reference-arrival budget")
+        await processor.synchronize()
+        try require(collector.samples.isEmpty, "\(name): skipped initial reference wait; actual=\(collector.samples.count)")
+        clock.advance(to: 0.08)
+        await processor.synchronize()
+        diagnostic("\(name) clock=logical logicalMs=80 earlySamples=\(collector.samples.count) realElapsedMs=\(Int((ProcessInfo.processInfo.systemUptime - realStart) * 1_000))")
+        try require(collector.samples.isEmpty,
+                    "\(name): capture age consumed the reference-arrival budget; actual=\(collector.samples.count), logicalMs=80")
         processor.appendReference(pcm, hostTime: epoch)
+        await processor.synchronize()
         let result = await processor.finish()
-        try verifyFile(result, collector: collector, expected: 320, name: name)
-        try require(result.diagnostics.processedSamples == 320, "\(name): late reference not used")
+        diagnostic("\(name) clock=logical logicalMs=80 finishedSamples=\(collector.samples.count) processedSamples=\(result.diagnostics.processedSamples) realElapsedMs=\(Int((ProcessInfo.processInfo.systemUptime - realStart) * 1_000))")
+        try verifyFile(result, collector: collector, expected: expected, name: name)
+        try require(result.diagnostics.processedSamples == result.frameCount,
+                    "\(name): late reference not used; processed=\(result.diagnostics.processedSamples), written=\(result.frameCount)")
         try require(result.missingReferenceSamples == 0, "\(name): early fallback")
         try require(collector.statuses.contains { $0.hasPrefix("回声处理中") }, "\(name): processing status")
     }
@@ -185,40 +217,40 @@ struct MacEchoHarness {
     @MainActor
     static func wholePacketDeadline(root: URL) async throws {
         let collector = Collector()
+        let clock = TestClock()
         let epoch = hostNow() - 0.25
-        let processor = try processor(name: "whole-packet-deadline", root: root, epoch: epoch, collector: collector)
+        let processor = try processor(name: "whole-packet-deadline", root: root, epoch: epoch, collector: collector, clock: clock)
         let expected = 8_000
         let frameSize = MeetingEchoProcessor.frameSize
         let pcm = try buffer(rate: 16_000, start: 0, count: expected) { _ in 0.12 }
-        let arrivedAt = ProcessInfo.processInfo.systemUptime
+        let realStart = ProcessInfo.processInfo.systemUptime
         processor.appendMicrophone(pcm, hostTime: epoch)
-        try await Task.sleep(nanoseconds: 80_000_000)
+        await processor.synchronize()
+        try require(collector.samples.isEmpty,
+                    "whole-packet-deadline: skipped initial reference wait; actual=\(collector.samples.count)")
+        clock.advance(to: 0.08)
+        await processor.synchronize()
         let earlySamples = collector.samples.count
-        let earlyMilliseconds = Int((ProcessInfo.processInfo.systemUptime - arrivedAt) * 1_000)
-        diagnostic("whole-packet-deadline earlySamples=\(earlySamples) elapsedMs=\(earlyMilliseconds)")
+        let earlyMilliseconds = Int((ProcessInfo.processInfo.systemUptime - realStart) * 1_000)
+        diagnostic("whole-packet-deadline clock=logical logicalMs=80 earlySamples=\(earlySamples) realElapsedMs=\(earlyMilliseconds)")
         try require(earlySamples == 0,
-                    "whole-packet-deadline: old capture timestamp skipped waiting; actual=\(earlySamples), elapsedMs=\(earlyMilliseconds)")
+                    "whole-packet-deadline: old capture timestamp skipped waiting; actual=\(earlySamples), logicalMs=80, realElapsedMs=\(earlyMilliseconds)")
         // Live delivery emits complete 320-sample frames. AVAudioConverter can
         // retain tail samples until EOS, leaving one incomplete processing
         // frame. Require the other 24 frames promptly, then verify all 25 at
-        // finish. A fresh 180ms wait per frame cannot pass this 500ms bound.
+        // finish. Advance past the shared 180ms packet deadline exactly once:
+        // a fresh per-frame wait would leave the remaining frames pending.
         let requiredLive = expected - frameSize
-        while collector.samples.count < requiredLive,
-              ProcessInfo.processInfo.systemUptime - arrivedAt < 0.5 {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        clock.advance(to: 0.181)
+        await processor.synchronize()
         let liveSamples = collector.samples.count
-        let elapsedMilliseconds = Int((ProcessInfo.processInfo.systemUptime - arrivedAt) * 1_000)
-        let bulkArrival = collector.deliveries.first { $0.samples >= requiredLive }?.at
-        let bulkMilliseconds = bulkArrival.map { Int(($0 - arrivedAt) * 1_000) }
-        diagnostic("whole-packet-deadline beforeFinishSamples=\(liveSamples) requiredLive=\(requiredLive) expectedTotal=\(expected) elapsedMs=\(elapsedMilliseconds) bulkDeliveryMs=\(bulkMilliseconds.map(String.init) ?? "unavailable")")
+        let elapsedMilliseconds = Int((ProcessInfo.processInfo.systemUptime - realStart) * 1_000)
+        diagnostic("whole-packet-deadline clock=logical logicalMs=181 beforeFinishSamples=\(liveSamples) requiredLive=\(requiredLive) expectedTotal=\(expected) realElapsedMs=\(elapsedMilliseconds)")
         let result = await processor.finish()
-        let finishMilliseconds = Int((ProcessInfo.processInfo.systemUptime - arrivedAt) * 1_000)
-        diagnostic("whole-packet-deadline finishedSamples=\(collector.samples.count) writtenSamples=\(result.frameCount) deliveredByFinish=\(collector.samples.count - liveSamples) passthroughSamples=\(result.diagnostics.passthroughSamples) elapsedMs=\(finishMilliseconds)")
+        let finishMilliseconds = Int((ProcessInfo.processInfo.systemUptime - realStart) * 1_000)
+        diagnostic("whole-packet-deadline clock=logical logicalMs=181 finishedSamples=\(collector.samples.count) writtenSamples=\(result.frameCount) deliveredByFinish=\(collector.samples.count - liveSamples) passthroughSamples=\(result.diagnostics.passthroughSamples) realElapsedMs=\(finishMilliseconds)")
         try require(liveSamples >= requiredLive && liveSamples <= expected && liveSamples % frameSize == 0,
-                    "whole-packet-deadline: frame-by-frame wait accumulated; actual=\(liveSamples), required=\(requiredLive)...\(expected), elapsedMs=\(elapsedMilliseconds)")
-        try require(bulkArrival.map { $0 - arrivedAt <= 0.5 } == true,
-                    "whole-packet-deadline: bulk delivery missed bounded deadline; bulkDeliveryMs=\(bulkMilliseconds.map(String.init) ?? "unavailable")")
+                    "whole-packet-deadline: frame-by-frame wait accumulated; actual=\(liveSamples), required=\(requiredLive)...\(expected), logicalMs=181, realElapsedMs=\(elapsedMilliseconds)")
         try verifyFile(result, collector: collector, expected: expected, name: "whole-packet-deadline")
         try require(result.diagnostics.passthroughSamples == result.frameCount,
                     "whole-packet-deadline: fail-open count; actual=\(result.diagnostics.passthroughSamples), written=\(result.frameCount)")
@@ -293,6 +325,7 @@ struct MacEchoHarness {
         try require(collector.samples.suffix(13).allSatisfy { abs($0 - 0.23) < 0.0001 }, "stop-tail: near voice lost")
         let after = try buffer(rate: 16_000, start: 333, count: 320) { _ in 0.5 }
         processor.appendMicrophone(after, hostTime: epoch + 333.0 / 16_000)
+        await processor.synchronize()
         let again = await processor.finish()
         try require(again.frameCount == 333 && collector.samples.count == 333, "stop-tail: post-finish data accepted")
     }
@@ -307,6 +340,7 @@ struct MacEchoHarness {
         await processor.cancel()
         processor.appendMicrophone(pcm, hostTime: epoch)
         processor.appendReference(pcm, hostTime: epoch)
+        await processor.synchronize()
         let result = await processor.finish()
         try require(result.url == nil && collector.samples.isEmpty, "cancel: late output escaped generation")
     }

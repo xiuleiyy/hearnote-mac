@@ -55,10 +55,10 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         let buffer: AVAudioPCMBuffer
         let hostTime: Double
         let arrivedAt: Double
-        init(_ buffer: AVAudioPCMBuffer, _ hostTime: Double) {
+        init(_ buffer: AVAudioPCMBuffer, _ hostTime: Double, arrivedAt: Double) {
             self.buffer = buffer
             self.hostTime = hostTime
-            arrivedAt = ProcessInfo.processInfo.systemUptime
+            self.arrivedAt = arrivedAt
         }
     }
 
@@ -98,6 +98,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
     private let url: URL
     private let format: AVAudioFormat
     private let canceller: AcousticEchoCanceller
+    private let monotonicNow: @Sendable () -> Double
     private let onOutput: @MainActor @Sendable (AVAudioPCMBuffer, Double) -> Void
     private let onStatus: @MainActor @Sendable (String) -> Void
     // All state below is owned by queue.
@@ -136,10 +137,12 @@ final class MeetingEchoProcessor: @unchecked Sendable {
 
     init(directory: URL, epoch: Double,
          onOutput: @escaping @MainActor @Sendable (AVAudioPCMBuffer, Double) -> Void,
-         onStatus: @escaping @MainActor @Sendable (String) -> Void) throws {
+         onStatus: @escaping @MainActor @Sendable (String) -> Void,
+         monotonicNow: @escaping @Sendable () -> Double = { ProcessInfo.processInfo.systemUptime }) throws {
         self.epoch = epoch
         self.onOutput = onOutput
         self.onStatus = onStatus
+        self.monotonicNow = monotonicNow
         url = directory.appendingPathComponent("microphone-cleaned.caf")
         guard epoch.isFinite,
               let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32,
@@ -164,7 +167,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
 
     /// Called by the capture sink before its raw-file flush can finish, not by UI delivery.
     func appendMicrophone(_ buffer: AVAudioPCMBuffer, hostTime: Double) {
-        let packet = Packet(buffer, hostTime)
+        let packet = Packet(buffer, hostTime, arrivedAt: monotonicNow())
         queue.async { [self, packet] in
             guard !isCancelled, !finished else { return }
             guard failure == nil else {
@@ -207,7 +210,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
     }
 
     func appendReference(_ buffer: AVAudioPCMBuffer, hostTime: Double) {
-        let packet = Packet(buffer, hostTime)
+        let packet = Packet(buffer, hostTime, arrivedAt: monotonicNow())
         queue.async { [self, packet] in
             guard !isCancelled, !finished, failure == nil else { return }
             do {
@@ -230,6 +233,23 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                 drainMicrophone(finishing: false)
             } catch {
                 degrade(error)
+            }
+        }
+    }
+
+    /// Drains eligible complete frames and awaits previously submitted live
+    /// callbacks. It does not flush converter tails, finish capture or write EOS.
+    /// Together with an injected monotonic clock this makes deadline checks
+    /// independent of MainActor/timer scheduling delays.
+    func synchronize() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async { [self] in
+                if !isCancelled, !finished { drainMicrophone(finishing: false) }
+                let deliveries = deliveryTail
+                Task {
+                    if let deliveries { await deliveries.value }
+                    continuation.resume()
+                }
             }
         }
     }
@@ -387,7 +407,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                 if pendingStart == nil { pendingStart = start }
                 pendingMicrophone.append(contentsOf: samples)
                 pendingDeadlines.append(PendingDeadline(
-                    sampleCount: samples.count, expiresAt: ProcessInfo.processInfo.systemUptime
+                    sampleCount: samples.count, expiresAt: monotonicNow()
                 ))
             }
         }
@@ -399,7 +419,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
             if pendingMicrophone.count < Self.frameSize && !finishing { return }
             let count = min(Self.frameSize, pendingMicrophone.count)
             let reference = referenceFrame(start: start, count: count)
-            let now = ProcessInfo.processInfo.systemUptime
+            let now = monotonicNow()
             // A late reference may arrive before its own buffered microphone is processed.
             // After 180ms, or when stopping, preserve the microphone instead of muting it.
             if reference == nil, !finishing,
@@ -535,7 +555,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         let buffer = try makeBuffer(samples)
         try file.write(from: buffer)
         writtenFrames += Int64(samples.count)
-        deliver(Packet(buffer, epoch + Double(start) / Double(Self.sampleRate)))
+        deliver(Packet(buffer, epoch + Double(start) / Double(Self.sampleRate), arrivedAt: monotonicNow()))
     }
 
     private func deliver(_ packet: Packet) {
@@ -550,7 +570,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
 
     private func setStatus(_ status: String) {
         guard lastStatus != status else { return }
-        let now = ProcessInfo.processInfo.systemUptime
+        let now = monotonicNow()
         guard status == failure || now - lastStatusUpdate >= 0.5 else { return }
         lastStatus = status
         lastStatusUpdate = now
@@ -569,7 +589,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         // Deliver any already converted microphone tail without applying cancellation.
         if let start = pendingStart, !pendingMicrophone.isEmpty,
            let buffer = try? makeBuffer(pendingMicrophone) {
-            deliver(Packet(buffer, epoch + Double(start) / Double(Self.sampleRate)))
+            deliver(Packet(buffer, epoch + Double(start) / Double(Self.sampleRate), arrivedAt: monotonicNow()))
         }
         pendingMicrophone.removeAll()
         pendingDeadlines.removeAll()
