@@ -38,6 +38,58 @@ final class LiveTranslationQueueTests: XCTestCase {
         XCTAssertEqual(queue.next(now: origin), segment)
     }
 
+    func testSentenceDraftWaitsForFinalEvenWhenTextHasNotChanged() {
+        var queue = LiveTranslationQueue()
+        var draft = TranscriptSegment(start: 0, end: 2, text: "Please keep the")
+        queue.update(draft, isFinal: false, now: origin, requiresFinal: true)
+        XCTAssertTrue(queue.isWaitingForSentence(for: draft))
+        XCTAssertNil(queue.next(now: origin.addingTimeInterval(30)))
+
+        draft.text = "Please keep the response time below 200 milliseconds."
+        draft.end = 6
+        queue.update(draft, isFinal: true, now: origin.addingTimeInterval(6), requiresFinal: true)
+        XCTAssertFalse(queue.isWaitingForSentence(for: draft))
+        XCTAssertEqual(queue.next(now: origin.addingTimeInterval(6)), draft)
+        XCTAssertTrue(queue.commit("请将响应时间保持在 200 毫秒以下。", for: draft))
+    }
+
+    func testUnfinishedSentenceCanFlushAndDoesNotBlockAnotherAudioSource() {
+        var queue = LiveTranslationQueue()
+        let draft = TranscriptSegment(start: 0, end: 2, text: "The remaining", source: "麦克风")
+        let complete = TranscriptSegment(start: 3, end: 4, text: "Please continue.", source: "会议声音")
+        queue.update(draft, isFinal: false, now: origin, requiresFinal: true)
+        queue.update(complete, isFinal: true, now: origin, requiresFinal: true)
+        XCTAssertEqual(queue.next(now: origin.addingTimeInterval(30)), complete)
+        XCTAssertTrue(queue.commit("请继续。", for: complete))
+        XCTAssertNil(queue.next(now: origin.addingTimeInterval(30)))
+        XCTAssertEqual(queue.next(now: origin, flush: true), draft)
+    }
+
+    func testRevisedCompletedSentenceWithdrawsOldTranslationUntilNewFinal() {
+        var queue = LiveTranslationQueue()
+        var segment = TranscriptSegment(text: "Deploy tomorrow.")
+        queue.update(segment, isFinal: true, now: origin, requiresFinal: true)
+        XCTAssertTrue(queue.commit("明天部署。", for: segment))
+        segment.text = "Do not deploy"
+        queue.update(segment, isFinal: false, now: origin, requiresFinal: true)
+        XCTAssertNil(queue.translation(for: segment))
+        XCTAssertNil(queue.next(now: origin.addingTimeInterval(30)))
+        segment.text = "Do not deploy tomorrow."
+        queue.update(segment, isFinal: true, now: origin, requiresFinal: true)
+        XCTAssertEqual(queue.next(now: origin), segment)
+    }
+
+    func testResumingTranslationDoesNotTranslateAnUnchangedPausedSentence() {
+        var queue = LiveTranslationQueue()
+        let segment = TranscriptSegment(text: "A complete sentence.")
+        queue.suspend()
+        queue.update(segment, isFinal: false, now: origin, requiresFinal: true)
+        queue.resume()
+        queue.update(segment, isFinal: true, now: origin, requiresFinal: true)
+        XCTAssertFalse(queue.hasPending)
+        XCTAssertNil(queue.next(now: origin.addingTimeInterval(30), flush: true))
+    }
+
     func testRevisedTextInvalidatesVisibleTranslationAndRejectsOutdatedResult() {
         var queue = LiveTranslationQueue()
         let original = TranscriptSegment(text: "明天发布。")

@@ -314,6 +314,7 @@ final class WhisperSpeechService: ObservableObject {
             let duration = try await asset.load(.duration).seconds
             guard duration.isFinite, duration > 0 else { throw MediaServiceError.invalidDuration }
             var start: Double = 0
+            var sentences = TranscriptSentenceAssembler()
             while start < duration {
                 try self.checkFileRun(id)
                 let end = min(duration, start + 24)
@@ -326,29 +327,35 @@ final class WhisperSpeechService: ObservableObject {
                                                     language: language,
                                                     restrictToChineseEnglish: restrictToChineseEnglish)
                 try self.checkFileRun(id)
-                let pieces = Self.words(from: results)
+                let decodedWords = Self.words(from: results)
+                let pieces = decodedWords
                     .filter { word in
                         let midpoint = audioStart + (word.start + word.end) / 2
                         return midpoint >= start && midpoint < end
                     }
-                if !pieces.isEmpty {
-                    // 保持短段和时间戳；按实际词时间，而非模型窗口时长归属正文。
-                    let groups = Dictionary(grouping: pieces) {
-                        Int(max(0, audioStart + $0.start) / 5)
-                    }
-                    for bucket in groups.keys.sorted() {
-                        guard let words = groups[bucket],
-                              let first = words.first, let last = words.last else { continue }
-                        let text = words.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !text.isEmpty {
-                            self.partialSegments.append(TranscriptSegment(
-                                start: audioStart + first.start,
-                                end: max(audioStart + first.start + 0.01, audioStart + last.end),
-                                text: text
-                            ))
-                        }
+                let absoluteWords = pieces.map {
+                    TimedWord(start: audioStart + $0.start, end: audioStart + $0.end, text: $0.text)
+                }
+                let updates = sentences.update(
+                    words: absoluteWords, replacingFrom: start, observedThrough: audioEnd,
+                    stableThrough: end,
+                    followingWord: decodedWords.first(where: {
+                        audioStart + ($0.start + $0.end) / 2 >= end
+                    }).map {
+                        TimedWord(start: audioStart + $0.start, end: audioStart + $0.end, text: $0.text)
+                    },
+                    finishing: end >= duration
+                )
+                for update in updates {
+                    if update.segment.text.isEmpty {
+                        self.partialSegments.removeAll { $0.id == update.segment.id }
+                    } else if let index = self.partialSegments.firstIndex(where: { $0.id == update.segment.id }) {
+                        self.partialSegments[index] = update.segment
+                    } else {
+                        self.partialSegments.append(update.segment)
                     }
                 }
+                self.partialSegments.sort { $0.start < $1.start }
                 start = end
                 self.progress = start / duration
             }
@@ -743,6 +750,9 @@ final class WhisperLiveRecognizer: ObservableObject {
                     let complete = epoch.closed || epoch.end >= epoch.coreStart + 15
                     let coreEnd = min(epoch.end, epoch.coreStart + 12)
                     if coreEnd <= epoch.coreStart {
+                        for sentence in epoch.sentences.finish(source: self.source) {
+                            self.update?(sentence.segment, sentence.isFinal)
+                        }
                         self.epochs.removeFirst()
                         continue
                     }
@@ -761,7 +771,10 @@ final class WhisperLiveRecognizer: ObservableObject {
                     try Task.checkCancellation()
                     guard self.sessionID == session else { return }
                     self.publish(results, epoch: epoch, audioStart: audioStart,
-                                 coreEnd: coreEnd, complete: complete)
+                                 audioEnd: audioEnd, coreEnd: coreEnd, complete: complete,
+                                 trailingSilenceFrom: Self.trailingSilenceStart(
+                                    samples: snapshot, audioStart: epoch.offset + audioStart
+                                 ))
                     if complete {
                         epoch.coreStart = coreEnd
                         if epoch.closed && epoch.coreStart >= epoch.end {
@@ -772,9 +785,6 @@ final class WhisperLiveRecognizer: ObservableObject {
                                              max(0, Int((retainFrom - epoch.bufferStart) * Self.sampleRate)))
                             epoch.samples.removeFirst(remove)
                             epoch.bufferStart += Double(remove) / Self.sampleRate
-                            // 已提交正文由文档保存，只保留当前可修订窗口的辅助状态。
-                            epoch.latest = epoch.latest.filter { Double($0.key * 3) >= epoch.coreStart }
-                            epoch.segmentIDs = epoch.segmentIDs.filter { Double($0.key * 3) >= epoch.coreStart }
                             // 新正文已有部分音频，可尽快显示，不等下一次 timer。
                             epoch.lastDecodedEnd = epoch.coreStart
                         }
@@ -798,43 +808,57 @@ final class WhisperLiveRecognizer: ObservableObject {
     }
 
     private func publish(_ results: [TranscriptionResult], epoch: AudioEpoch,
-                         audioStart: Double, coreEnd: Double, complete: Bool) {
-        let words = WhisperSpeechService.words(from: results).filter {
+                         audioStart: Double, audioEnd: Double, coreEnd: Double, complete: Bool,
+                         trailingSilenceFrom: Double?) {
+        let decodedWords = WhisperSpeechService.words(from: results)
+        let words = decodedWords.filter {
             let midpoint = audioStart + ($0.start + $0.end) / 2
             return midpoint >= epoch.coreStart && midpoint < coreEnd
         }
-        let groups = Dictionary(grouping: words) {
-            Int(max(0, audioStart + ($0.start + $0.end) / 2) / 3)
-        }
-        let currentBuckets = Set(groups.keys)
-        // 删除当前可修订窗口中已经消失的 partial，避免留下错误临时文字。
-        for bucket in epoch.latest.keys.sorted() {
-            guard let previous = epoch.latest[bucket],
-                  Double(bucket * 3) >= epoch.coreStart, !currentBuckets.contains(bucket) else { continue }
-            var removed = previous.segment
-            removed.text = ""
-            update?(removed, false)
-            epoch.latest.removeValue(forKey: bucket)
-        }
-        for bucket in groups.keys.sorted() {
-            guard let pieces = groups[bucket], let first = pieces.first, let last = pieces.last else { continue }
-            let text = pieces.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
-            let id = epoch.segmentIDs[bucket] ?? UUID()
-            epoch.segmentIDs[bucket] = id
-            let segment = TranscriptSegment(
-                id: id, start: epoch.offset + audioStart + first.start,
-                end: max(epoch.offset + audioStart + first.start + 0.01,
-                         epoch.offset + audioStart + last.end),
-                text: text, source: source
+        let absoluteWords = words.map {
+            WhisperSpeechService.TimedWord(
+                start: epoch.offset + audioStart + $0.start,
+                end: epoch.offset + audioStart + $0.end, text: $0.text
             )
-            let finalized = complete || bucket != groups.keys.max()
-            if epoch.latest[bucket]?.segment != segment ||
-                epoch.latest[bucket]?.finalized != finalized {
-                epoch.latest[bucket] = LiveChunk(segment: segment, finalized: finalized)
-                update?(segment, finalized)
-            }
         }
+        let changes = epoch.sentences.update(
+            words: absoluteWords, replacingFrom: epoch.offset + epoch.coreStart,
+            observedThrough: epoch.offset + audioEnd,
+            stableThrough: epoch.offset + (complete ? coreEnd : epoch.coreStart),
+            followingWord: decodedWords.first(where: {
+                audioStart + ($0.start + $0.end) / 2 >= coreEnd
+            }).map {
+                WhisperSpeechService.TimedWord(
+                    start: epoch.offset + audioStart + $0.start,
+                    end: epoch.offset + audioStart + $0.end, text: $0.text
+                )
+            },
+            trailingSilenceFrom: trailingSilenceFrom, source: source,
+            finishing: complete && epoch.closed && coreEnd >= epoch.end
+        )
+        for change in changes {
+            update?(change.segment, change.isFinal)
+        }
+    }
+
+    /// 尾部停顿必须有采集 PCM 的静音证据，不能用解码窗口截断位置猜测。
+    /// 使用与无声解码筛选相同的保守能量阈值；背景声会延迟停顿完成而非丢词。
+    private static func trailingSilenceStart(samples: [Float], audioStart: Double) -> Double? {
+        let frameSize = 320
+        var index = samples.count
+        while index >= frameSize {
+            let start = index - frameSize
+            let frame = samples[start..<index]
+            var energy: Double = 0
+            for sample in frame {
+                guard sample.isFinite else { return nil }
+                energy += Double(sample) * Double(sample)
+            }
+            if sqrt(energy / Double(frameSize)) >= 0.0005 { break }
+            index = start
+        }
+        guard samples.count - index >= Int(Self.sampleRate * 0.8) else { return nil }
+        return audioStart + Double(index) / Self.sampleRate
     }
 
     private func resolveFinishIfDone() {
@@ -859,14 +883,9 @@ private final class AudioEpoch {
     var coreStart: Double = 0
     var lastDecodedEnd: Double = 0
     var closed = false
-    var segmentIDs: [Int: UUID] = [:]
-    var latest: [Int: LiveChunk] = [:]
+    var sentences = TranscriptSentenceAssembler()
     var end: Double { bufferStart + Double(samples.count) / 16_000 }
     init(offset: Double) { self.offset = offset }
 }
 
-private struct LiveChunk {
-    let segment: TranscriptSegment
-    let finalized: Bool
-}
 #endif

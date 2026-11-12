@@ -6,6 +6,7 @@ public struct LiveTranslationQueue {
         var segment: TranscriptSegment
         var lastTextChange: Date
         var isFinal: Bool
+        var requiresFinal: Bool
     }
 
     private let stabilityInterval: TimeInterval
@@ -25,7 +26,13 @@ public struct LiveTranslationQueue {
         pending[segment.id]?.segment.text == segment.text
     }
 
-    public mutating func update(_ segment: TranscriptSegment, isFinal: Bool, now: Date) {
+    public func isWaitingForSentence(for segment: TranscriptSegment) -> Bool {
+        guard let entry = pending[segment.id], entry.segment.text == segment.text else { return false }
+        return entry.requiresFinal && !entry.isFinal
+    }
+
+    public mutating func update(_ segment: TranscriptSegment, isFinal: Bool, now: Date,
+                                requiresFinal: Bool = false) {
         guard translatedTexts[segment.id] != segment.text else { return }
 
         // 原文被更正后，旧译文立即失效；即使原文稍后恢复，也要重新排队。
@@ -45,17 +52,20 @@ public struct LiveTranslationQueue {
             // 时间戳更新不改变文字稳定计时；已经稳定的同一文字继续保持可提交状态。
             entry.segment = segment
             entry.isFinal = entry.isFinal || isFinal
+            entry.requiresFinal = requiresFinal
             pending[segment.id] = entry
         } else {
             pending[segment.id] = Entry(
-                segment: segment, lastTextChange: now, isFinal: isFinal
+                segment: segment, lastTextChange: now, isFinal: isFinal,
+                requiresFinal: requiresFinal
             )
         }
     }
 
     public func next(now: Date, flush: Bool = false) -> TranscriptSegment? {
         pending.values.filter {
-            flush || $0.isFinal || now.timeIntervalSince($0.lastTextChange) >= stabilityInterval
+            flush || $0.isFinal ||
+                (!$0.requiresFinal && now.timeIntervalSince($0.lastTextChange) >= stabilityInterval)
         }.sorted {
             let lhsStart = $0.segment.start.isFinite ? $0.segment.start : .greatestFiniteMagnitude
             let rhsStart = $1.segment.start.isFinite ? $1.segment.start : .greatestFiniteMagnitude

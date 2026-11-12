@@ -172,7 +172,7 @@ final class AppState: ObservableObject {
     private lazy var systemMixedSpeech = mixedSpeech.makeLiveRecognizer()
     let repository: DocumentRepository
     let root: URL
-    private var workTask: Task<Void, Never>?
+    @Published private var workTask: Task<Void, Never>?
     private var liveTranslationTask: Task<Void, Never>?
     private var meetingRecognitionTask: Task<Void, Never>?
     private var meetingRecognitionID: UUID?
@@ -220,6 +220,27 @@ final class AppState: ObservableObject {
     var isBusy: Bool { workTask != nil || isImporting || isStartingRecording || isStoppingRecording }
     var canCancelWork: Bool { workTask != nil }
     var recordingDirectory: URL { root.appendingPathComponent("Recording", isDirectory: true) }
+
+    private var noteActionContext: NoteActionContext {
+        NoteActionContext(
+            isQuitting: isQuitting,
+            isStartingRecording: isStartingRecording,
+            isStoppingRecording: isStoppingRecording,
+            isRecording: recorder.isRecording || liveDocumentID != nil,
+            isImporting: isImporting,
+            isProcessing: workTask != nil
+        )
+    }
+    func aiBlockReason(for document: NoteDocument) -> NoteActionBlockReason? {
+        noteActionContext.aiBlockReason(hasTranscript: document.hasTranscriptText)
+    }
+    func transcriptionBlockReason(for document: NoteDocument) -> NoteActionBlockReason? {
+        noteActionContext.transcriptionBlockReason(hasMedia: document.mediaFilename != nil)
+    }
+    func actionBlockMessage(_ reason: NoteActionBlockReason) -> String {
+        if reason == .processing, let busyMessage { return busyMessage }
+        return reason.message
+    }
 
     func presentSetupIfNeeded() {
         if !preferences.hasCompletedSetup { showSettings = true }
@@ -304,6 +325,7 @@ final class AppState: ObservableObject {
         if translatingSegment?.id == segment.id && translatingSegment?.text == segment.text {
             return "正在翻译…"
         }
+        if translationQueue.isWaitingForSentence(for: segment) { return "正在补全当前句…" }
         if translationQueue.isPending(for: segment) { return "等待译文…" }
         return "未翻译"
     }
@@ -376,8 +398,15 @@ final class AppState: ObservableObject {
         }
     }
     func transcribeSelected() {
-        guard let document = selectedDocument, let filename = document.mediaFilename,
-              !recorder.isRecording, !isBusy else { return }
+        guard let document = selectedDocument else {
+            errorMessage = "请先选择要转写的笔记。"
+            return
+        }
+        if let reason = transcriptionBlockReason(for: document) {
+            errorMessage = actionBlockMessage(reason)
+            return
+        }
+        guard let filename = document.mediaFilename else { return }
         let locale = preferences.speechLocale
         let allowCloud = preferences.allowCloudRecognition
         let modelVariant = preferences.whisperModel
@@ -420,8 +449,14 @@ final class AppState: ObservableObject {
     }
     func runAI(_ tab: DetailTab) {
         guard tab == .translation || tab == .summary else { return }
-        guard let document = selectedDocument, !document.segments.isEmpty,
-              !isBusy, !recorder.isRecording else { return }
+        guard let document = selectedDocument else {
+            errorMessage = "请先选择要处理的笔记。"
+            return
+        }
+        if let reason = aiBlockReason(for: document) {
+            errorMessage = actionBlockMessage(reason)
+            return
+        }
         do {
             let client = try makeClient()
             let language = preferences.targetLanguage
@@ -451,6 +486,7 @@ final class AppState: ObservableObject {
         } catch { errorMessage = error.localizedDescription; showSettings = true }
     }
     func cancelWork() {
+        if workTask != nil { busyMessage = "正在取消当前任务…" }
         workTask?.cancel()
         transcriber.cancel()
         mixedSpeech.cancelTranscription()
@@ -641,10 +677,17 @@ final class AppState: ObservableObject {
         let microphoneActive = meetingUsesWhisper ? microphoneMixedSpeech.isRecognizing : microphoneSpeech.isRecognizing
         let systemActive = meetingUsesWhisper ? systemMixedSpeech.isRecognizing : systemSpeech.isRecognizing
         if microphoneActive || systemActive {
-            let engine = meetingUsesWhisper ? "本地 Whisper" : "Apple 语音识别"
-            liveRecognitionStatus = "\(engine)已就绪 · 等待识别结果"
+            liveRecognitionStatus = "\(meetingRecognitionDescription)已就绪 · 等待识别结果"
         } else {
             liveRecognitionStatus = "当前暂未转写 · 录音继续保存，可在会后重新转写。"
+        }
+    }
+    private var meetingRecognitionDescription: String {
+        guard meetingUsesWhisper else { return "Apple 语音识别" }
+        switch mixedSpeech.loadedModelVariant {
+        case WhisperSpeechService.defaultModelVariant: return "本地 Whisper Large v3 Turbo "
+        case "small": return "本地 Whisper Small "
+        default: return "本地 Whisper "
         }
     }
     func cancelMeetingRecognitionPreparation() {
@@ -663,8 +706,9 @@ final class AppState: ObservableObject {
             persist()
             return
         }
-        if recorder.isRecording, liveRecognitionStatus != "正在转写 · 原文和录音保存在本机" {
-            liveRecognitionStatus = "正在转写 · 原文和录音保存在本机"
+        let status = "\(meetingRecognitionDescription)正在转写 · 原文和录音保存在本机"
+        if recorder.isRecording, liveRecognitionStatus != status {
+            liveRecognitionStatus = status
         }
         if let existing = documents[index].segments.firstIndex(where: { $0.id == segment.id }) {
             let previous = documents[index].segments[existing]
@@ -674,7 +718,8 @@ final class AppState: ObservableObject {
             documents[index].segments[existing] = updated
         } else { documents[index].segments.append(segment) }
         documents[index].segments.sort { $0.start < $1.start }
-        translationQueue.update(segment, isFinal: final, now: Date())
+        translationQueue.update(segment, isFinal: final, now: Date(),
+                                requiresFinal: meetingUsesWhisper)
         // 原文更正时立即撤下旧译文；仅时间戳变化不重置文字稳定计时。
         liveTranslations = translationQueue.translations
         if final || Date().timeIntervalSince(lastPersistence) >= 5 {
@@ -703,8 +748,11 @@ final class AppState: ObservableObject {
         liveTranslationTask = Task {
             while !Task.isCancelled && (recorder.isRecording || translationQueue.hasPending) {
                 if translateLive && !isTranslatingLive {
-                    // 文字稳定后翻译；已过时间桶边界的片段可立即提交。
-                    if let segment = translationQueue.next(now: Date(), flush: !recorder.isRecording) {
+                    // Whisper 在句末、停顿或有界句长后提交，避免反复翻译半句。
+                    // Apple 识别仍使用文字稳定策略，停止时可收尾待处理结果。
+                    if let segment = translationQueue.next(
+                        now: Date(), flush: !recorder.isRecording && !isStoppingRecording
+                    ) {
                         await translateLiveSegment(segment)
                         // 有成熟片段时接着处理，避免每次完成后再固定等待 300 ms。
                         continue
@@ -798,12 +846,17 @@ final class AppState: ObservableObject {
         let finishedID = liveDocumentID
         if let id = finishedID {
             updateDocument(id) { document in
-                document.translation = document.segments.compactMap { segment in
-                    guard let translation = segment.validTranslation?.text else {
-                        return "[\(Self.clock(segment.start))] 待翻译：结束时尚未完成，可点击“翻译全文”。"
-                    }
-                    return "[\(Self.clock(segment.start))] \(translation)"
-                }.joined(separator: "\n\n")
+                // 没有实际译文时保留空状态，不能把“待翻译”提示存成成功译文。
+                if document.translationContent.translatedSegments.isEmpty {
+                    document.translation = ""
+                } else {
+                    document.translation = document.segments.compactMap { segment in
+                        guard let translation = segment.validTranslation?.text else {
+                            return "[\(Self.clock(segment.start))] 待翻译：结束时尚未完成，可点击“翻译全文”。"
+                        }
+                        return "[\(Self.clock(segment.start))] \(translation)"
+                    }.joined(separator: "\n\n")
+                }
                 document.translationLanguage = preferences.targetLanguage
             }
         }

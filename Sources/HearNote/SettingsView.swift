@@ -153,7 +153,7 @@ struct SettingsView: View {
                     }
                 }
                 Spacer()
-                Button("保存并继续") { save() }.buttonStyle(.borderedProminent)
+                Button("保存并继续") { save() }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
                     .disabled(testing || state.recorder.isRecording)
             }
         }.padding(28).frame(width: 700, height: 720).tint(Palette.accent)

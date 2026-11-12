@@ -4,7 +4,12 @@ import AVKit
 import HearNoteCore
 
 enum Palette {
-    static let accent = Color(red: 0.27, green: 0.39, blue: 0.30)
+    static let accent = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.61, green: 0.81, blue: 0.66, alpha: 1)
+            : NSColor(srgbRed: 0.27, green: 0.39, blue: 0.30, alpha: 1)
+    })
+    static let actionFill = Color(red: 0.27, green: 0.39, blue: 0.30)
     static let paper = Color(nsColor: .windowBackgroundColor)
     static let muted = Color.secondary
 }
@@ -38,12 +43,14 @@ struct WorkspaceView: View {
                         ProgressView().controlSize(.small)
                         Text(busy).font(.callout).foregroundStyle(.secondary)
                         Spacer()
-                        if state.canCancelWork { Button("取消") { state.cancelWork() }.buttonStyle(.plain) }
+                        if state.canCancelWork {
+                            Button("取消任务") { state.cancelWork() }.buttonStyle(.bordered)
+                        }
                     }.padding(14).background(.bar)
                 }
             }
         }
-        .tint(Palette.accent)
+        .tint(Palette.actionFill)
         .background(Palette.paper)
         .sheet(isPresented: $state.showSettings) { SettingsView().environmentObject(state) }
         .onChange(of: state.preferences.targetLanguage) { _, _ in state.persistPreferences() }
@@ -69,7 +76,7 @@ struct WorkspaceView: View {
                 Label(hasCurrentMeeting ? "返回当前会议" : "开始会议录音",
                       systemImage: hasCurrentMeeting ? "waveform" : "mic.fill")
                     .font(.system(size: 13, weight: .medium)).frame(maxWidth: .infinity).padding(.vertical, 6)
-            }.buttonStyle(.borderedProminent)
+            }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
                 .disabled(state.isQuitting || (state.isBusy && !hasCurrentMeeting))
             if state.workspaceTab == .notes {
                 TextField("搜索笔记", text: $state.searchText)
@@ -158,7 +165,7 @@ struct WorkspaceView: View {
                 Button("其他 Region…") { state.showSettings = true }
             } label: {
                 Label(SettingsView.regionName(state.preferences.region), systemImage: "globe.asia.australia")
-                    .font(.caption).lineLimit(1)
+                    .font(.caption).foregroundStyle(.primary).lineLimit(1)
             }.menuStyle(.borderlessButton).frame(maxWidth: 120)
             Menu {
                 ForEach(state.preferences.models) { model in
@@ -167,11 +174,18 @@ struct WorkspaceView: View {
                 Divider()
                 Button("管理模型…") { state.showSettings = true }
             } label: {
-                Label(state.activeModelName, systemImage: "sparkles").font(.caption).lineLimit(1)
+                Label(state.activeModelName, systemImage: "sparkles")
+                    .font(.caption).foregroundStyle(.primary).lineLimit(1)
             }.menuStyle(.borderlessButton).frame(maxWidth: 220)
             if state.workspaceTab == .notes {
                 Button { state.importDocument() } label: { Label("导入", systemImage: "plus") }
+                    .buttonStyle(.bordered)
                     .disabled(state.isBusy || state.recorder.isRecording)
+                    .help(state.recorder.isRecording
+                          ? "会议仍在录音，请先结束并保存，再导入文件。"
+                          : (state.isBusy
+                             ? (state.busyMessage ?? "正在处理当前操作，请稍候再导入。")
+                             : "导入音视频或文字"))
             }
         }.padding(.horizontal, 26).padding(.vertical, 19)
     }
@@ -207,25 +221,19 @@ struct DocumentView: View {
                             Text("内置示例，未调用模型").foregroundStyle(Palette.accent)
                         }
                     }.font(.caption).foregroundStyle(.secondary)
-                    HStack {
-                        Picker("内容", selection: $state.detailTab) {
-                            ForEach(DetailTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                        }.pickerStyle(.segmented).frame(width: 290)
-                        Spacer()
-                        if state.detailTab == .translation {
-                            Picker("目标", selection: $state.preferences.targetLanguage) {
-                                ForEach(BedrockClient.supportedLanguages, id: \.self) { Text($0).tag($0) }
-                            }.labelsHidden().frame(width: 110)
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 12) {
+                            detailPicker
+                            Spacer(minLength: 0)
+                            documentActions(for: document)
                         }
-                        if state.detailTab == .translation || state.detailTab == .summary {
-                            Button {
-                                state.runAI(state.detailTab)
-                            } label: {
-                                Label(state.detailTab == .translation ? "翻译全文" : "生成摘要", systemImage: "sparkles")
-                            }.disabled(state.isBusy || document.segments.isEmpty)
-                        } else if state.detailTab == .transcript && document.mediaFilename != nil {
-                            Button("重新转写") { state.transcribeSelected() }.disabled(state.isBusy)
+                        VStack(alignment: .leading, spacing: 12) {
+                            detailPicker
+                            documentActions(for: document)
                         }
+                    }
+                    if let reason = currentActionBlockReason(for: document) {
+                        actionAvailability(for: document, reason: reason)
                     }
                 }.padding(.horizontal, 34).padding(.top, 28).padding(.bottom, 22)
                 Divider()
@@ -247,7 +255,7 @@ struct DocumentView: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 22) {
                             if state.detailTab == .transcript {
-                                if document.segments.isEmpty {
+                                if !document.hasTranscriptText {
                                     ContentUnavailableView("等待转写", systemImage: "text.bubble",
                                                            description: Text("导入后会开始转写；录音会实时显示识别结果。"))
                                 } else {
@@ -256,16 +264,12 @@ struct DocumentView: View {
                                     }
                                 }
                             } else if state.detailTab == .translation {
-                                if document.translation.isEmpty {
-                                    emptyAI("把语言变成桥梁", "选择目标语言，然后点击“翻译全文”。")
-                                } else {
-                                    Text(document.translation).font(.system(size: 15)).lineSpacing(7).textSelection(.enabled)
-                                    Text("实时译文可能只包含已完成片段；“翻译全文”会重新处理完整原文。")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
+                                translationBody(for: document)
                             } else if state.detailTab == .summary {
                                 if document.summary.isEmpty {
-                                    emptyAI("从对话里找到重点", "生成带时间戳的重点、决定与待办。")
+                                    emptyAI("从对话里找到重点",
+                                            state.aiBlockReason(for: document).map(state.actionBlockMessage)
+                                                ?? "点击上方“生成摘要”，整理重点、决定与待办。")
                                 } else {
                                     MarkdownText(text: document.summary)
                                 }
@@ -276,6 +280,132 @@ struct DocumentView: View {
                 if document.mediaFilename != nil { PlayerView(player: state.player) }
             }
             .onAppear { state.select(document) }
+        }
+    }
+    private var detailPicker: some View {
+        Picker("内容", selection: $state.detailTab) {
+            ForEach(DetailTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+        }.pickerStyle(.segmented).frame(width: 290)
+    }
+    @ViewBuilder
+    private func documentActions(for document: NoteDocument) -> some View {
+        HStack(spacing: 12) {
+            if state.detailTab == .translation {
+                Picker("目标", selection: $state.preferences.targetLanguage) {
+                    ForEach(BedrockClient.supportedLanguages, id: \.self) { Text($0).tag($0) }
+                }.labelsHidden().frame(width: 110)
+            }
+            if state.detailTab == .translation || state.detailTab == .summary {
+                let reason = state.aiBlockReason(for: document)
+                Button { state.runAI(state.detailTab) } label: {
+                    Label(state.detailTab == .translation ? "翻译全文" : "生成摘要",
+                          systemImage: "sparkles")
+                }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
+                    .disabled(reason != nil)
+                    .help(reason.map(state.actionBlockMessage)
+                          ?? (state.detailTab == .translation ? "翻译这份笔记的全部原文" : "整理这份笔记的重点与待办"))
+            } else if state.detailTab == .transcript && document.mediaFilename != nil {
+                let reason = state.transcriptionBlockReason(for: document)
+                Button("重新转写") { state.transcribeSelected() }
+                    .buttonStyle(.bordered).disabled(reason != nil)
+                    .help(reason.map(state.actionBlockMessage) ?? "使用当前语音设置重新识别录音")
+            }
+        }
+    }
+    private func currentActionBlockReason(for document: NoteDocument) -> NoteActionBlockReason? {
+        switch state.detailTab {
+        case .translation, .summary:
+            return state.aiBlockReason(for: document)
+        case .transcript:
+            return document.mediaFilename == nil ? nil : state.transcriptionBlockReason(for: document)
+        case .comparison:
+            return nil
+        }
+    }
+    private func actionAvailability(for document: NoteDocument, reason: NoteActionBlockReason) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(state.actionBlockMessage(reason))
+                .font(.callout).foregroundStyle(.secondary)
+                .lineSpacing(4).fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            actionRecovery(for: document, reason: reason)
+        }
+    }
+    @ViewBuilder
+    private func actionRecovery(for document: NoteDocument, reason: NoteActionBlockReason) -> some View {
+        switch reason {
+        case .recording, .startingRecording, .stoppingRecording:
+            Button("返回当前会议") { state.openMeetingWorkspace() }
+                .buttonStyle(.bordered)
+        case .processing:
+            // 有全局任务状态条时复用它的取消入口，避免同屏重复操作。
+            if state.canCancelWork && state.busyMessage == nil {
+                Button("取消任务") { state.cancelWork() }.buttonStyle(.bordered)
+            }
+        case .missingTranscript:
+            if state.transcriptionBlockReason(for: document) == nil {
+                Button("转写录音") { state.transcribeSelected() }.buttonStyle(.bordered)
+            } else {
+                Button("导入文字") { state.importDocument() }.buttonStyle(.bordered)
+            }
+        case .quitting, .importing, .missingMedia:
+            EmptyView()
+        }
+    }
+    @ViewBuilder
+    private func translationBody(for document: NoteDocument) -> some View {
+        let content = document.translationContent
+        if let savedText = content.savedText {
+            Text("已保存译文 · \(document.translationLanguage)")
+                .font(.caption).foregroundStyle(.secondary)
+            Text(savedText).font(.system(size: 17)).lineSpacing(7)
+                .foregroundStyle(.primary).textSelection(.enabled)
+        } else if content.hasContent {
+            Text(content.untranslatedSegmentCount == 0
+                 ? "已完成 \(content.translatedSegments.count) / \(content.sourceSegmentCount) 段实时译文。"
+                 : "已完成 \(content.translatedSegments.count) / \(content.sourceSegmentCount) 段实时译文；还有 \(content.untranslatedSegmentCount) 段尚未翻译。")
+                .font(.callout).foregroundStyle(.secondary)
+            LazyVStack(alignment: .leading, spacing: 18) {
+                ForEach(content.translatedSegments) { segment in
+                    if let translation = segment.validTranslation {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 10) {
+                                Text(AppState.clock(segment.start)).monospacedDigit()
+                                if let source = segment.source { Text(source) }
+                                Spacer()
+                                Text(translation.targetLanguage)
+                            }.font(.caption).foregroundStyle(.secondary)
+                            Text(translation.text).font(.system(size: 17)).lineSpacing(7)
+                                .foregroundStyle(.primary).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Divider()
+                        }
+                    }
+                }
+            }
+        } else if let reason = state.aiBlockReason(for: document) {
+            emptyAI(reason == .recording && state.liveDocumentID == document.id
+                    ? "实时译文尚未出现" : "暂时没有译文",
+                    translationEmptyDescription(for: document, reason: reason))
+        } else {
+            emptyAI("尚未生成译文", "原文已就绪。选择目标语言，点击上方“翻译全文”。")
+        }
+    }
+    private func translationEmptyDescription(for document: NoteDocument,
+                                            reason: NoteActionBlockReason) -> String {
+        switch reason {
+        case .recording:
+            if state.liveDocumentID != document.id {
+                return "另一场会议仍在录音。先结束并保存当前会议，再翻译这份笔记；实时译文请到当前会议查看。"
+            }
+            return "会议仍在录音。返回当前会议开启“实时翻译”，完成的译文会显示在这里；全文翻译需先结束并保存。"
+        case .missingTranscript:
+            if state.transcriptionBlockReason(for: document) == nil {
+                return "这份录音还没有识别文字。先点击上方“转写录音”，取得原文后再翻译。"
+            }
+            return "还没有可翻译的原文。先导入文字或完成录音转写。"
+        default:
+            return state.actionBlockMessage(reason)
         }
     }
     private func emptyAI(_ title: String, _ description: String) -> some View {
@@ -289,6 +419,11 @@ struct TranscriptRow: View {
     @EnvironmentObject private var state: AppState
     let documentID: UUID
     let segment: TranscriptSegment
+    private var canSeek: Bool {
+        state.liveDocumentID != documentID &&
+            state.documents.first(where: { $0.id == documentID })?.mediaFilename != nil
+    }
+    private var isReadOnly: Bool { state.isBusy || state.liveDocumentID == documentID }
     var body: some View {
         HStack(alignment: .top, spacing: 19) {
             Button { state.player.seek(to: segment.start) } label: {
@@ -296,16 +431,25 @@ struct TranscriptRow: View {
                     .foregroundStyle(Palette.accent).padding(.vertical, 6).padding(.horizontal, 8)
                     .background(Palette.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
             }.buttonStyle(.plain)
+                .disabled(!canSeek)
+                .help(canSeek ? "回听这一段" : "录音保存后可回听；文字笔记没有音频。")
             VStack(alignment: .leading, spacing: 7) {
                 if let source = segment.source {
                     Text(source).font(.caption2).foregroundStyle(.secondary)
                 }
-                TextField("文字", text: Binding(
-                    get: { state.documents.first { $0.id == documentID }?.segments.first { $0.id == segment.id }?.text ?? "" },
-                    set: { state.updateText(documentID: documentID, segmentID: segment.id, text: $0) }
-                ), axis: .vertical)
-                .textFieldStyle(.plain).font(.system(size: 15)).lineSpacing(6)
-                .disabled(state.isBusy || state.liveDocumentID == documentID)
+                Group {
+                    if isReadOnly {
+                        Text(segment.text).foregroundStyle(.primary).textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .help("录音或处理期间暂时只读，仍可选择和复制文字。")
+                    } else {
+                        TextField("文字", text: Binding(
+                            get: { state.documents.first { $0.id == documentID }?.segments.first { $0.id == segment.id }?.text ?? "" },
+                            set: { state.updateText(documentID: documentID, segmentID: segment.id, text: $0) }
+                        ), axis: .vertical)
+                        .textFieldStyle(.plain).foregroundStyle(.primary)
+                    }
+                }.font(.system(size: 17)).lineSpacing(6)
             }.frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -381,7 +525,7 @@ struct RecordingView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .tint(Palette.accent)
+        .tint(Palette.actionFill)
         // 不订阅 recorder 的计时/电平更新；只有录音阶段变化影响完整界面。
         .onReceive(state.recorder.$isRecording) { recorderIsRecording = $0 }
     }
@@ -401,6 +545,7 @@ struct RecordingView: View {
                 state.workspaceTab = .notes
             } label: {
                 Label("返回笔记", systemImage: "arrow.left")
+                    .foregroundStyle(.primary)
             }
             .buttonStyle(.borderless)
             .help(meetingIsActive ? "录音继续，可从侧栏返回当前会议。" : "返回笔记列表。")
@@ -551,11 +696,12 @@ struct RecordingView: View {
             } else if meetingIsActive {
                 Button { Task { await state.stopMeeting() } } label: {
                     Label("结束并保存", systemImage: "stop.fill")
-                }.buttonStyle(.borderedProminent).disabled(!recorderIsRecording)
+                }.buttonStyle(.borderedProminent).tint(Palette.actionFill).disabled(!recorderIsRecording)
             } else {
                 Button { Task { await state.startMeeting() } } label: {
                     Label("开始录音", systemImage: "mic.fill")
-                }.buttonStyle(.borderedProminent).disabled(state.isBusy || state.isQuitting)
+                }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
+                    .disabled(state.isBusy || state.isQuitting)
             }
         }
     }
