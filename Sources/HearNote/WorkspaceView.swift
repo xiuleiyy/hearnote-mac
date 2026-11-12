@@ -375,11 +375,20 @@ struct RecordingView: View {
                     .font(.callout).foregroundStyle(.secondary).lineSpacing(5)
             }
             languageControls
+            if !meetingIsActive {
+                SpeechRecognitionEnginePicker(
+                    selection: $state.preferences.speechEngine,
+                    speechLocale: state.preferences.speechLocale,
+                    isLocked: state.isStartingRecording
+                )
+                Text("中英混合在中文／英文之间识别；English 固定英文，适合全英文会议。翻译方向由“翻译为”单独设置。")
+                    .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
+            }
             if state.preferences.targetLanguage == BedrockClient.bilingualLanguage {
                 Text("中文 → 英文 · English → 中文；同句混用时保留专业术语。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if !meetingIsActive && state.preferences.speechLocale == "zh-en" {
+            if !meetingIsActive && state.preferences.usesWhisperRecognition {
                 MixedSpeechModelControls(
                     service: state.mixedSpeech, modelVariant: $state.preferences.whisperModel,
                     isLocked: {
@@ -390,9 +399,35 @@ struct RecordingView: View {
             }
             modelControls
             if meetingIsActive {
+                RecordingAudioStatusView(recorder: state.recorder)
+                if state.isPreparingMeetingRecognition {
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(alignment: .top, spacing: 12) {
+                            if state.preferences.usesWhisperRecognition {
+                                WhisperPreparationStatusView(service: state.mixedSpeech)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            } else {
+                                Text("正在准备 Apple 语音识别…")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            Button("取消准备") { state.cancelMeetingRecognitionPreparation() }
+                                .disabled(state.isStoppingRecording)
+                        }
+                        Text("录音继续保存；模型就绪后识别新声音，准备期间的音频可在会后重新转写。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Text(state.liveRecognitionStatus.isEmpty ? "等待识别状态…" : state.liveRecognitionStatus)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    .help(state.liveRecognitionStatus)
                 if !state.liveRecognitionWarning.isEmpty {
-                    Text(state.liveRecognitionWarning).font(.caption).foregroundStyle(.orange)
-                        .lineSpacing(4).lineLimit(2).help(state.liveRecognitionWarning)
+                    ScrollView {
+                        Text(state.liveRecognitionWarning).font(.caption).foregroundStyle(.orange)
+                            .lineSpacing(4).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 48)
                 }
                 if let document = state.documents.first(where: { $0.id == state.liveDocumentID }) {
                     TranscriptComparisonView(documentID: document.id, segments: document.segments, isLive: true)
@@ -404,7 +439,7 @@ struct RecordingView: View {
                     Text("正在准备会议记录…").foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, minHeight: 230)
                 }
-                Text(state.liveTranslationStatus.isEmpty ? "实时识别中 · 原文保存在本机" : state.liveTranslationStatus)
+                Text(state.liveTranslationStatus.isEmpty ? "录音和文字保存在本机" : state.liveTranslationStatus)
                     .font(.caption).foregroundStyle(.secondary).lineLimit(2).help(state.liveTranslationStatus)
             } else {
                 VStack(alignment: .leading, spacing: 10) {
@@ -415,7 +450,7 @@ struct RecordingView: View {
             }
             recordingActions.layoutPriority(1)
         }
-        .padding(24).frame(width: 900).frame(height: meetingIsActive ? 650 : nil)
+        .padding(24).frame(width: 900).frame(height: meetingIsActive ? 720 : nil)
         .frame(minHeight: 380)
         .tint(Palette.accent)
         .interactiveDismissDisabled(meetingIsActive || state.isStartingRecording || state.isStoppingRecording)
@@ -468,7 +503,7 @@ struct RecordingView: View {
             Spacer()
             if state.isStartingRecording || state.isStoppingRecording {
                 ProgressView().controlSize(.small)
-                Text(state.isStartingRecording ? "正在准备…" : "正在保存…").font(.callout)
+                Text(state.isStartingRecording ? "正在开始录音…" : "正在保存…").font(.callout)
             } else if recorderIsRecording {
                 Button { Task { await state.stopMeeting() } } label: {
                     Label("结束并保存", systemImage: "stop.fill")
@@ -479,6 +514,41 @@ struct RecordingView: View {
                 }.buttonStyle(.borderedProminent)
             }
         }
+    }
+}
+
+@MainActor
+private struct RecordingAudioStatusView: View {
+    @ObservedObject var recorder: MeetingRecorder
+
+    var body: some View {
+        HStack(spacing: 20) {
+            if recorder.source.includesMicrophone {
+                sourceStatus("麦克风", duration: recorder.microphoneAudioDuration,
+                             level: recorder.microphoneAudioLevel)
+            }
+            if recorder.source.includesSystem {
+                sourceStatus("系统声音", duration: recorder.systemAudioDuration,
+                             level: recorder.systemAudioLevel)
+            }
+            Spacer(minLength: 0)
+        }
+        .font(.caption).foregroundStyle(.secondary)
+    }
+
+    private func sourceStatus(_ title: String, duration: Double, level: Double) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: level > 0.005 ? "waveform" : "speaker.wave.1")
+                .foregroundStyle(level > 0.005 ? Palette.accent : Color.secondary)
+            Text(duration > 0
+                 ? "\(title) · 已收到音频 \(AppState.clock(duration))"
+                 : "\(title) · 等待音频")
+                .monospacedDigit()
+            Text(level > 0.005 ? "当前有声音" : "当前电平较低")
+        }
+        .help(duration > 0
+              ? "已收到音频数据，是否包含可识别的说话内容以转写结果为准。"
+              : "尚未收到音频。请检查录音来源、系统录制权限和会议软件的声音输出。")
     }
 }
 

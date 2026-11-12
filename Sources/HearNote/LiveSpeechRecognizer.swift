@@ -9,6 +9,7 @@ import Speech
 final class LiveSpeechRecognizer: ObservableObject {
     @Published private(set) var isRecognizing = false
     @Published private(set) var errorMessage: String?
+    @Published private(set) var recognitionStatus = "已停止"
 
     /// 双输入源由调用方设置同一会议起点，保证时间戳在同一条时间轴上。
     var timelineOrigin: Date?
@@ -36,37 +37,43 @@ final class LiveSpeechRecognizer: ObservableObject {
         cancel()
         let id = UUID()
         sessionID = id
-        let resolvedRecognizer = try await SpeechPermissions.recognizer(
-            locale: locale, allowCloudRecognition: allowCloudRecognition
-        )
-        try Task.checkCancellation()
-        guard sessionID == id else { throw CancellationError() }
-        recognizer = resolvedRecognizer
-        configuration = Configuration(
-            requiresOnDevice: !allowCloudRecognition,
-            contextualStrings: Array(contextualStrings.prefix(100)),
-            source: source
-        )
-        origin = timelineOrigin ?? Date()
-        update = onUpdate
         errorMessage = nil
-        isRecognizing = true
-        openStream(session: id)
-        rotationTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do { try await Task.sleep(nanoseconds: 43_000_000_000) }
-                catch { return }
-                guard let self, self.sessionID == id, self.isRecognizing else { return }
-                self.rotateStream(session: id)
+        recognitionStatus = "正在检查语音识别…"
+        do {
+            let resolvedRecognizer = try await SpeechPermissions.recognizer(
+                locale: locale, allowCloudRecognition: allowCloudRecognition
+            )
+            try Task.checkCancellation()
+            guard sessionID == id else { throw CancellationError() }
+            recognizer = resolvedRecognizer
+            configuration = Configuration(
+                requiresOnDevice: !allowCloudRecognition,
+                contextualStrings: Array(contextualStrings.prefix(100)),
+                source: source
+            )
+            origin = timelineOrigin ?? Date()
+            update = onUpdate
+            isRecognizing = true
+            recognitionStatus = "等待音频"
+            // 捕获权限尚未完成时可能还没有 PCM；先不创建无输入的 Speech request。
+        } catch {
+            if sessionID == id {
+                sessionID = nil
+                isRecognizing = false
+                recognitionStatus = error is CancellationError ? "已停止" : "识别未就绪"
+                if !(error is CancellationError) { errorMessage = error.localizedDescription }
             }
+            throw error
         }
     }
 
     /// buffer 必须是独立副本；不能将 AudioEngine tap 会复用的原 buffer 留在异步队列。
     func append(_ buffer: AVAudioPCMBuffer, at timelineOffset: Double? = nil) {
         guard isRecognizing, let sessionID,
-              let id = currentStreamID, var stream = streams[id],
-              !stream.ended, buffer.frameLength > 0, buffer.format.sampleRate > 0 else { return }
+              buffer.frameLength > 0, buffer.format.sampleRate.isFinite,
+              buffer.format.sampleRate > 0 else { return }
+        if currentStreamID == nil { openStream(session: sessionID) }
+        guard let id = currentStreamID, var stream = streams[id], !stream.ended else { return }
         let incomingDuration = Double(buffer.frameLength) / buffer.format.sampleRate
         let explicitOffset = timelineOffset.flatMap { $0.isFinite ? max(0, $0) : nil }
         if stream.receivedAudio {
@@ -74,6 +81,8 @@ final class LiveSpeechRecognizer: ObservableObject {
             // 长静音另开request；当前request不注入整场会议的历史静音。
             if gap > 6 || stream.audioDuration + gap + incomingDuration > 43 {
                 rotateStream(session: sessionID)
+                // 当前确实有新的 PCM，结束旧 request 后再创建下一 request。
+                openStream(session: sessionID)
                 guard let newID = currentStreamID, let newStream = streams[newID] else { return }
                 stream = newStream
             } else if gap > 0.08 {
@@ -86,6 +95,7 @@ final class LiveSpeechRecognizer: ObservableObject {
         }
         stream.request.append(buffer)
         stream.audioDuration += incomingDuration
+        if recognitionStatus != "识别中" { recognitionStatus = "识别中" }
     }
 
     private func appendSilence(seconds: Double, format: AVAudioFormat, to stream: RecognitionStream) {
@@ -113,6 +123,7 @@ final class LiveSpeechRecognizer: ObservableObject {
         rotationTask = nil
         currentStreamID = nil
         for stream in Array(streams.values) { end(stream) }
+        recognitionStatus = streams.isEmpty ? "已停止" : "正在收尾…"
         resolveFinishWaitersIfNeeded()
     }
 
@@ -146,6 +157,7 @@ final class LiveSpeechRecognizer: ObservableObject {
         recognizer = nil
         configuration = nil
         update = nil
+        recognitionStatus = "已停止"
         let waiters = finishWaiters
         finishWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
@@ -153,7 +165,7 @@ final class LiveSpeechRecognizer: ObservableObject {
 
     private func openStream(session: UUID) {
         guard let recognizer, let configuration,
-              sessionID == session, isRecognizing else { return }
+              sessionID == session, isRecognizing, currentStreamID == nil else { return }
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.requiresOnDeviceRecognition = configuration.requiresOnDevice
@@ -172,12 +184,12 @@ final class LiveSpeechRecognizer: ObservableObject {
                       self.streams[stream.id] != nil else { return }
                 if let result {
                     self.receive(result, stream: stream)
-                    if result.isFinal {
+                    if result.isFinal && error == nil {
                         let wasCurrent = self.currentStreamID == stream.id
                         self.remove(stream)
-                        // Speech 可自行提前终结；继续录音时立即建立下一请求。
+                        // 下一 request 等收到下一帧音频再建立，不让静音间隙空跑。
                         if wasCurrent, self.isRecognizing {
-                            self.openStream(session: session)
+                            self.recognitionStatus = "等待音频"
                         }
                         return
                     }
@@ -187,17 +199,25 @@ final class LiveSpeechRecognizer: ObservableObject {
                 }
             }
         }
+        rotationTask?.cancel()
+        rotationTask = Task { [weak self, weak stream] in
+            do { try await Task.sleep(nanoseconds: 43_000_000_000) }
+            catch { return }
+            guard let self, let stream, self.sessionID == session,
+                  self.isRecognizing, self.currentStreamID == stream.id else { return }
+            self.rotateStream(session: session)
+        }
     }
 
     private func rotateStream(session: UUID) {
-        guard let id = currentStreamID, let outgoing = streams[id] else {
-            openStream(session: session)
-            return
-        }
+        guard sessionID == session, let id = currentStreamID,
+              let outgoing = streams[id] else { return }
         // 不向两个request重复投喂同一buffer，避免文字重复。
         currentStreamID = nil
+        rotationTask?.cancel()
+        rotationTask = nil
         end(outgoing)
-        openStream(session: session)
+        if isRecognizing { recognitionStatus = "等待音频" }
     }
 
     private func end(_ stream: RecognitionStream) {
@@ -214,11 +234,13 @@ final class LiveSpeechRecognizer: ObservableObject {
             catch { return }
             guard let self, let stream, self.streams[stream.id] != nil else { return }
             stream.task?.cancel()
-            if !stream.latest.isEmpty {
-                // 保留partial，但不把它谎称为Speech最终结果。
-                self.errorMessage = "部分语音没有返回最终识别结果，已保留临时文字；可用录音重新转写校对。"
-            }
+            // 收到了 PCM 却没返回文字，也必须可见；它可能是静音，不能断言录音损坏。
+            let warning = LiveSpeechRecognitionError.finalResultTimedOut(
+                hasPartialText: !stream.latest.isEmpty
+            )
+            self.errorMessage = warning.localizedDescription
             self.remove(stream)
+            self.onError?(warning)
         }
     }
 
@@ -267,16 +289,19 @@ final class LiveSpeechRecognizer: ObservableObject {
         let wasCurrent = currentStreamID == stream.id
         let hadAudio = stream.receivedAudio
         let endedWithoutWords = stream.ended && stream.latest.isEmpty
+        let activeFailure = wasCurrent && !stream.ended && isRecognizing && sessionID == session
         remove(stream)
-        guard hadAudio, !endedWithoutWords else { return }
+        // 当前 request 在首帧前失败同样是识别故障，不能让 isRecognizing 假装继续。
+        guard activeFailure || (hadAudio && !endedWithoutWords) else { return }
         errorMessage = "实时识别中断：\(error.localizedDescription)。录音仍可继续，之后可以重新转写。"
-        onError?(error)
         // 已结束request的错误不影响正在识别的新一段。
-        if wasCurrent, isRecognizing, sessionID == session {
+        if activeFailure {
             isRecognizing = false
+            recognitionStatus = "识别失败"
             rotationTask?.cancel()
             rotationTask = nil
         }
+        onError?(error)
     }
 
     private func remove(_ stream: RecognitionStream) {
@@ -284,15 +309,33 @@ final class LiveSpeechRecognizer: ObservableObject {
         stream.deadline = nil
         stream.task = nil
         streams.removeValue(forKey: stream.id)
-        if currentStreamID == stream.id { currentStreamID = nil }
+        if currentStreamID == stream.id {
+            currentStreamID = nil
+            rotationTask?.cancel()
+            rotationTask = nil
+        }
         resolveFinishWaitersIfNeeded()
     }
 
     private func resolveFinishWaitersIfNeeded() {
         guard streams.isEmpty else { return }
+        if !isRecognizing && recognitionStatus == "正在收尾…" { recognitionStatus = "已停止" }
         let waiters = finishWaiters
         finishWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
+    }
+}
+
+private enum LiveSpeechRecognitionError: LocalizedError {
+    case finalResultTimedOut(hasPartialText: Bool)
+
+    var errorDescription: String? {
+        switch self {
+        case .finalResultTimedOut(let hasPartialText):
+            return hasPartialText
+                ? "部分语音没有在截止时间内返回最终结果，已保留临时文字与录音，可在会后重新转写。"
+                : "已收到音频，但这一段没有在截止时间内返回文字。音频可能是静音，请检查收音状态；录音仍保留，可在会后重新转写。"
+        }
     }
 }
 

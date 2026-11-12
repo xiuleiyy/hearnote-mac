@@ -12,6 +12,7 @@ enum WhisperSpeechError: LocalizedError {
     case decoderBusy
     case unsupportedModel
     case incompleteLocalModel
+    case preparationFailed
     case modelUnavailable
     case audioConversion
     case decodingBacklog
@@ -23,6 +24,7 @@ enum WhisperSpeechError: LocalizedError {
         case .decoderBusy: return "语音识别仍在处理，请结束当前任务后再切换模型。"
         case .unsupportedModel: return "请选择支持中英文的多语种模型；英文专用模型不能用于中英混合识别。"
         case .incompleteLocalModel: return "本地模型目录不完整。请导入包含 Core ML 模型、tokenizer.json 和 tokenizer_config.json 的完整目录。"
+        case .preparationFailed: return "模型准备失败。请检查网络，或导入完整的本地模型目录后重试。"
         case .modelUnavailable: return "请先下载或导入中英混合识别模型。"
         case .audioConversion: return "音频无法转换为识别所需格式；原始录音仍会保留。"
         case .decodingBacklog: return "本地识别速度暂时跟不上会议音频，已暂停该来源的实时转写。录音继续保存，可在会后重新转写或尝试较小模型。"
@@ -37,6 +39,8 @@ final class WhisperSpeechService: ObservableObject {
     nonisolated static let defaultModelVariant = "large-v3-v20240930_turbo"
     @Published private(set) var isPreparing = false
     @Published private(set) var modelStatus = "中英混合模型尚未准备"
+    @Published private(set) var preparationProgress: Double?
+    @Published private(set) var preparationElapsed: TimeInterval = 0
     @Published private(set) var loadedModelVariant = ""
     @Published private(set) var isTranscribing = false
     @Published private(set) var progress: Double = 0
@@ -61,7 +65,6 @@ final class WhisperSpeechService: ObservableObject {
               modelFolder?.lastPathComponent.contains(".en") != true else {
             throw WhisperSpeechError.unsupportedModel
         }
-        if kit != nil, loadedModelVariant == modelVariant, modelFolder == nil { return }
         if preparationTask != nil, let currentID = preparationID {
             guard preparingVariant == modelVariant, preparingFolder == modelFolder else {
                 throw WhisperSpeechError.preparationBusy
@@ -71,10 +74,11 @@ final class WhisperSpeechService: ObservableObject {
             }
             return try await awaitPreparation(id: currentID)
         }
+        if kit != nil, loadedModelVariant == modelVariant, modelFolder == nil { return }
         guard decodeTail == nil, !isTranscribing else { throw WhisperSpeechError.decoderBusy }
         if let folder = modelFolder {
             let required = ["tokenizer.json", "tokenizer_config.json"]
-            guard required.allSatisfy({
+            guard Self.hasCoreMLModels(at: folder), required.allSatisfy({
                 FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path)
             }) else { throw WhisperSpeechError.incompleteLocalModel }
         }
@@ -85,11 +89,28 @@ final class WhisperSpeechService: ObservableObject {
         preparingVariant = modelVariant
         preparingFolder = modelFolder
         isPreparing = true
+        preparationProgress = nil
+        preparationElapsed = 0
+        modelStatus = "正在检查本地模型"
         let task = Task { @MainActor [weak self] in
             guard let self else { throw CancellationError() }
+            let startedAt = Date()
+            let elapsedTask = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(nanoseconds: 1_000_000_000) }
+                    catch { return }
+                    guard let self, self.preparationID == id,
+                          self.cancelledPreparationID != id else { return }
+                    self.preparationElapsed = max(0, Date().timeIntervalSince(startedAt))
+                }
+            }
             var outcome: Result<Void, Error> = .failure(CancellationError())
+            var phase = "模型准备"
             defer {
+                elapsedTask.cancel()
                 if self.preparationID == id {
+                    self.preparationProgress = nil
+                    self.preparationElapsed = max(0, Date().timeIntervalSince(startedAt))
                     self.preparationResult = (id, outcome)
                     self.resolvePreparationWaiters(outcome)
                     self.preparationID = nil
@@ -100,22 +121,49 @@ final class WhisperSpeechService: ObservableObject {
                 }
             }
             do {
-            let support = FileManager.default.urls(for: .applicationSupportDirectory,
-                                                   in: .userDomainMask).first!
-            let cache = support.appendingPathComponent("HearNote/WhisperModels", isDirectory: true)
-            try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
-            let folderKey = "HearNote.whisper.folder.\(modelVariant)"
-            let savedPath = UserDefaults.standard.string(forKey: folderKey)
-            let cachedFolder = savedPath.flatMap { path -> URL? in
-                FileManager.default.fileExists(atPath: path) ? URL(fileURLWithPath: path) : nil
-            }
-            let folder = modelFolder ?? cachedFolder
-            self.modelStatus = folder == nil
-                ? "正在下载并准备 \(modelVariant)，首次使用需要模型和 tokenizer"
-                : "正在加载本地 \(modelVariant)"
-            // 切换时先释放旧模型，降低两个完整模型同时占用内存的峰值。
-            self.kit = nil
-            self.loadedModelVariant = ""
+                try self.checkPreparation(id)
+                let support = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                       in: .userDomainMask).first!
+                let cache = support.appendingPathComponent("HearNote/WhisperModels", isDirectory: true)
+                try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+                let folderKey = "HearNote.whisper.folder.\(modelVariant)"
+                let savedPath = UserDefaults.standard.string(forKey: folderKey)
+                let cachedFolder = savedPath.flatMap { path -> URL? in
+                    let candidate = URL(fileURLWithPath: path, isDirectory: true)
+                    return Self.hasCoreMLModels(at: candidate) ? candidate : nil
+                }
+                // 切换时先释放旧模型，降低两个完整模型同时占用内存的峰值。
+                self.kit = nil
+                self.loadedModelVariant = ""
+                let folder: URL
+                if let localFolder = modelFolder ?? cachedFolder {
+                    folder = localFolder
+                } else {
+                    phase = "模型下载"
+                    self.modelStatus = "正在下载 \(modelVariant) · 文件准备进度"
+                    self.preparationProgress = 0
+                    folder = try await WhisperKit.download(
+                        variant: modelVariant, downloadBase: cache,
+                        progressCallback: { [weak self] progress in
+                            // SDK 的总量是文件数；这里只显示真实 fraction，不换算为字节。
+                            let fraction = progress.fractionCompleted
+                            Task { @MainActor [weak self] in
+                                guard let self, self.preparationID == id,
+                                      self.cancelledPreparationID != id,
+                                      self.preparationProgress != nil,
+                                      fraction.isFinite else { return }
+                                self.preparationProgress = min(1, max(0, fraction))
+                            }
+                        }
+                    )
+                    try self.checkPreparation(id)
+                    // tokenizer 或 Core ML 准备失败时仍复用已下载的模型目录。
+                    UserDefaults.standard.set(folder.path, forKey: folderKey)
+                    self.preparationProgress = nil
+                }
+                try self.checkPreparation(id)
+                phase = "本地模型初始化"
+                self.modelStatus = "正在准备本地 \(modelVariant)"
                 #if arch(arm64)
                 let computeOptions: ModelComputeOptions? = nil
                 #else
@@ -126,14 +174,19 @@ final class WhisperSpeechService: ObservableObject {
                 )
                 #endif
                 let prepared = try await WhisperKit(WhisperKitConfig(
-                    model: modelVariant, downloadBase: cache, modelFolder: folder?.path,
+                    model: modelVariant, downloadBase: cache, modelFolder: folder.path,
                     computeOptions: computeOptions,
-                    verbose: false, prewarm: true, load: true, download: folder == nil
+                    verbose: false, prewarm: false, load: false, download: false
                 ))
-                try Task.checkCancellation()
-                guard self.preparationID == id, self.cancelledPreparationID != id else {
-                    throw CancellationError()
-                }
+                try self.checkPreparation(id)
+                phase = "模型预热"
+                self.modelStatus = "正在预热 \(modelVariant) · 首次使用可能较久"
+                try await prepared.prewarmModels()
+                try self.checkPreparation(id)
+                phase = "模型及 tokenizer 加载"
+                self.modelStatus = "正在加载模型及 tokenizer · 首次可能需要下载 tokenizer"
+                try await prepared.loadModels()
+                try self.checkPreparation(id)
                 guard prepared.modelVariant.isMultilingual else { throw WhisperSpeechError.unsupportedModel }
                 self.kit = prepared
                 self.loadedModelVariant = modelVariant
@@ -147,15 +200,39 @@ final class WhisperSpeechService: ObservableObject {
                 if self.preparationID == id { self.modelStatus = "模型准备已取消" }
                 throw CancellationError()
             } catch {
-                outcome = .failure(error)
-                if self.preparationID == id {
-                    self.modelStatus = "模型准备失败，可检查网络或导入完整本地模型目录"
+                // SDK 取消有时以网络错误返回，仍按取消处理，避免错误状态覆盖用户操作。
+                if Task.isCancelled || self.cancelledPreparationID == id || self.preparationID != id {
+                    outcome = .failure(CancellationError())
+                    if self.preparationID == id { self.modelStatus = "模型准备已取消" }
+                    throw CancellationError()
                 }
-                throw error
+                // 下载异常可能包含请求 URL；交给 UI 的错误只保留安全的通用说明。
+                let failure = (error as? WhisperSpeechError) ?? .preparationFailed
+                outcome = .failure(failure)
+                if self.preparationID == id {
+                    self.modelStatus = "\(phase)失败，可检查网络或导入完整本地模型目录"
+                }
+                throw failure
             }
         }
         preparationTask = task
         try await awaitPreparation(id: id)
+    }
+
+    private func checkPreparation(_ id: UUID) throws {
+        try Task.checkCancellation()
+        guard preparationID == id, cancelledPreparationID != id else { throw CancellationError() }
+    }
+
+    private static func hasCoreMLModels(at folder: URL) -> Bool {
+        ["MelSpectrogram", "AudioEncoder", "TextDecoder"].allSatisfy { name in
+            ["mlmodelc", "mlpackage"].contains { ext in
+                var isDirectory: ObjCBool = false
+                let path = folder.appendingPathComponent("\(name).\(ext)", isDirectory: true).path
+                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            }
+        }
     }
 
     /// SDK 下载/预热未必及时响应 Task.cancel；调用方等待独立 continuation，
@@ -200,6 +277,7 @@ final class WhisperSpeechService: ObservableObject {
         let cancellation: Result<Void, Error> = .failure(CancellationError())
         preparationResult = (id, cancellation)
         resolvePreparationWaiters(cancellation)
+        preparationProgress = nil
         modelStatus = "正在取消模型准备…"
     }
 
@@ -214,8 +292,11 @@ final class WhisperSpeechService: ObservableObject {
 
     /// 每次只读取至多 30 秒 PCM，视频与音频统一从音轨提取。
     func transcribe(url: URL, contextualStrings: [String],
-                    modelVariant: String = WhisperSpeechService.defaultModelVariant) async throws
+                    modelVariant: String = WhisperSpeechService.defaultModelVariant,
+                    locale: String = "zh-en") async throws
         -> [TranscriptSegment] {
+        let language = Self.decodingLanguage(for: locale)
+        let restrictToChineseEnglish = Self.isChineseEnglishLocale(locale)
         guard fileTask == nil else { throw WhisperSpeechError.decoderBusy }
         try await prepare(modelVariant: modelVariant)
         try Task.checkCancellation()
@@ -241,7 +322,9 @@ final class WhisperSpeechService: ObservableObject {
                 let samples = try Self.readAudio(asset: asset, track: track,
                                                 start: audioStart, end: audioEnd)
                 let results = try await self.decode(samples: samples,
-                                                    contextualStrings: contextualStrings)
+                                                    contextualStrings: contextualStrings,
+                                                    language: language,
+                                                    restrictToChineseEnglish: restrictToChineseEnglish)
                 try self.checkFileRun(id)
                 let pieces = Self.words(from: results)
                     .filter { word in
@@ -300,7 +383,20 @@ final class WhisperSpeechService: ObservableObject {
         guard fileRunID == id else { throw CancellationError() }
     }
 
-    fileprivate func decode(samples: [Float], contextualStrings: [String]) async throws
+    fileprivate static func decodingLanguage(for locale: String) -> String? {
+        let normalized = locale.lowercased().replacingOccurrences(of: "_", with: "-")
+        guard normalized != "zh-en",
+              let language = normalized.split(separator: "-").first.map(String.init),
+              ["zh", "en", "ja", "ko", "fr", "de", "es"].contains(language) else { return nil }
+        return language
+    }
+
+    fileprivate static func isChineseEnglishLocale(_ locale: String) -> Bool {
+        locale.lowercased().replacingOccurrences(of: "_", with: "-") == "zh-en"
+    }
+
+    fileprivate func decode(samples: [Float], contextualStrings: [String],
+                            language: String?, restrictToChineseEnglish: Bool) async throws
         -> [TranscriptionResult] {
         try Task.checkCancellation()
         guard let kit else { throw WhisperSpeechError.modelUnavailable }
@@ -310,10 +406,27 @@ final class WhisperSpeechService: ObservableObject {
         let task = Task { @MainActor () throws -> [TranscriptionResult] in
             if let predecessor { _ = try? await predecessor.value }
             try Task.checkCancellation()
+            let originalDecoder = kit.textDecoder
+            defer { kit.textDecoder = originalDecoder }
+            if restrictToChineseEnglish {
+                guard let standard = originalDecoder as? TextDecoder,
+                      standard.isModelMultilingual, let model = standard.model,
+                      let tokenizer = kit.tokenizer else {
+                    throw WhisperSpeechError.unsupportedModel
+                }
+                let scoped = TextDecoder()
+                // 共享已加载的模型，不重新加载或复制模型；每个窗口的检测缓存互相独立。
+                scoped.model = model
+                scoped.isModelMultilingual = standard.isModelMultilingual
+                scoped.logitsFilters = standard.logitsFilters
+                scoped.tokenizer = try ChineseEnglishTokenizer(base: tokenizer)
+                // decodeTail 串行保护 SDK；无论成功、失败还是取消都会恢复默认解码器。
+                kit.textDecoder = scoped
+            }
             var options = DecodingOptions(
-                verbose: false, task: .transcribe, language: nil,
+                verbose: false, task: .transcribe, language: language,
                 temperature: 0, temperatureFallbackCount: 1,
-                usePrefillPrompt: true, detectLanguage: true,
+                usePrefillPrompt: true, detectLanguage: language == nil,
                 skipSpecialTokens: true, withoutTimestamps: false, wordTimestamps: true,
                 windowClipTime: 0,
                 concurrentWorkerCount: 1
@@ -422,6 +535,33 @@ final class WhisperSpeechService: ObservableObject {
     }
 }
 
+/// 仅限制 SDK 的语言预测候选；所有文字编码、解码和词时间戳行为仍使用原 tokenizer。
+private struct ChineseEnglishTokenizer: WhisperTokenizer {
+    private let base: any WhisperTokenizer
+    let allLanguageTokens: Set<Int>
+    var specialTokens: SpecialTokens { base.specialTokens }
+
+    init(base: any WhisperTokenizer) throws {
+        guard let chinese = base.convertTokenToId("<|zh|>"),
+              let english = base.convertTokenToId("<|en|>"),
+              chinese != english,
+              base.allLanguageTokens.contains(chinese),
+              base.allLanguageTokens.contains(english) else {
+            throw WhisperSpeechError.unsupportedModel
+        }
+        self.base = base
+        allLanguageTokens = [chinese, english]
+    }
+
+    func encode(text: String) -> [Int] { base.encode(text: text) }
+    func decode(tokens: [Int]) -> String { base.decode(tokens: tokens) }
+    func convertTokenToId(_ token: String) -> Int? { base.convertTokenToId(token) }
+    func convertIdToToken(_ id: Int) -> String? { base.convertIdToToken(id) }
+    func splitToWordTokens(tokenIds: [Int]) -> (words: [String], wordTokens: [[Int]]) {
+        base.splitToWordTokens(tokenIds: tokenIds)
+    }
+}
+
 /// 已有录音采集供应 PCM，不另外打开麦克风；每个来源独立缓冲，共享一个模型。
 @MainActor
 final class WhisperLiveRecognizer: ObservableObject {
@@ -432,6 +572,8 @@ final class WhisperLiveRecognizer: ObservableObject {
     private var sessionID: UUID?
     private var source = ""
     private var terms: [String] = []
+    private var language: String?
+    private var restrictToChineseEnglish = false
     private var update: ((TranscriptSegment, Bool) -> Void)?
     private var epochs: [AudioEpoch] = []
     private var converter: AVAudioConverter?
@@ -446,12 +588,14 @@ final class WhisperLiveRecognizer: ObservableObject {
 
     init(service: WhisperSpeechService) { self.service = service }
 
-    func start(contextualStrings: [String], source: String,
+    func start(contextualStrings: [String], source: String, locale: String = "zh-en",
                onUpdate: @escaping (TranscriptSegment, Bool) -> Void) async throws {
         cancel()
         guard !service.loadedModelVariant.isEmpty else { throw WhisperSpeechError.modelUnavailable }
         self.source = source
         terms = contextualStrings
+        language = WhisperSpeechService.decodingLanguage(for: locale)
+        restrictToChineseEnglish = WhisperSpeechService.isChineseEnglishLocale(locale)
         update = onUpdate
         origin = Date()
         let id = UUID()
@@ -584,6 +728,9 @@ final class WhisperLiveRecognizer: ObservableObject {
             return
         }
         let id = UUID()
+        let language = self.language
+        let restrictToChineseEnglish = self.restrictToChineseEnglish
+        let terms = self.terms
         processingID = id
         processingTask = Task { [weak self] in
             guard let self else { return }
@@ -610,7 +757,10 @@ final class WhisperLiveRecognizer: ObservableObject {
                     guard upper > lower else { return }
                     let snapshot = Array(epoch.samples[lower..<upper])
                     epoch.lastDecodedEnd = audioEnd
-                    let results = try await self.service.decode(samples: snapshot, contextualStrings: self.terms)
+                    let results = try await self.service.decode(samples: snapshot,
+                                                                contextualStrings: terms,
+                                                                language: language,
+                                                                restrictToChineseEnglish: restrictToChineseEnglish)
                     try Task.checkCancellation()
                     guard self.sessionID == session else { return }
                     self.publish(results, epoch: epoch, audioStart: audioStart,

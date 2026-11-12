@@ -62,6 +62,10 @@ final class MeetingRecorder: ObservableObject {
     @Published private(set) var level: Double = 0
     @Published private(set) var source: RecordingSource = .microphone
     @Published private(set) var errorMessage: String?
+    @Published private(set) var microphoneAudioDuration: Double = 0
+    @Published private(set) var systemAudioDuration: Double = 0
+    @Published private(set) var microphoneAudioLevel: Double = 0
+    @Published private(set) var systemAudioLevel: Double = 0
 
     /// These offsets share the timeline used by the final mixed audio file.
     /// Read the corresponding offset inside the first onBuffer callback.
@@ -84,6 +88,10 @@ final class MeetingRecorder: ObservableObject {
     private var startedHostTime: TimeInterval = 0
     private var systemLevel: Double = 0
     private var receivedSystemBuffer = false
+    private var capturedMicrophoneDuration: Double = 0
+    private var capturedSystemDuration: Double = 0
+    private var lastMicrophoneBufferAt = Double.negativeInfinity
+    private var lastSystemBufferAt = Double.negativeInfinity
     private var timerTask: Task<Void, Never>?
     private var activeExport: AVAssetExportSession?
 
@@ -98,6 +106,14 @@ final class MeetingRecorder: ObservableObject {
         level = 0
         systemLevel = 0
         receivedSystemBuffer = false
+        capturedMicrophoneDuration = 0
+        capturedSystemDuration = 0
+        microphoneAudioDuration = 0
+        systemAudioDuration = 0
+        microphoneAudioLevel = 0
+        systemAudioLevel = 0
+        lastMicrophoneBufferAt = .negativeInfinity
+        lastSystemBufferAt = .negativeInfinity
         firstMicrophoneOffset = 0
         firstSystemOffset = 0
         currentMicrophoneOffset = 0
@@ -133,7 +149,9 @@ final class MeetingRecorder: ObservableObject {
                 if let firstHostTime = mic?.firstBufferHostTime {
                     self.firstMicrophoneOffset = max(0, firstHostTime - epoch)
                 }
-                let bufferDuration = Double(pcm.frameLength) / pcm.format.sampleRate
+                let bufferDuration = Self.duration(of: pcm)
+                self.capturedMicrophoneDuration += bufferDuration
+                self.lastMicrophoneBufferAt = Self.hostTime()
                 self.currentMicrophoneOffset = self.firstMicrophoneOffset
                     + max(0, (mic?.elapsed ?? 0) - bufferDuration)
                 self.onMicrophoneBuffer?(pcm)
@@ -152,6 +170,8 @@ final class MeetingRecorder: ObservableObject {
                     self.receivedSystemBuffer = true
                 }
                 self.currentSystemOffset = max(0, hostTime - epoch)
+                self.capturedSystemDuration += Self.duration(of: pcm)
+                self.lastSystemBufferAt = Self.hostTime()
                 self.onSystemBuffer?(pcm)
             }
             system?.onLevel = { [weak self] value in
@@ -354,8 +374,14 @@ final class MeetingRecorder: ObservableObject {
             while !Task.isCancelled {
                 guard let self, self.generation == sessionID,
                       self.phase == .recording else { return }
-                self.elapsed = max(0, Self.hostTime() - self.startedHostTime)
-                self.level = max(self.microphone?.level ?? 0, self.systemLevel)
+                let now = Self.hostTime()
+                self.elapsed = max(0, now - self.startedHostTime)
+                self.microphoneAudioDuration = self.capturedMicrophoneDuration
+                self.systemAudioDuration = self.capturedSystemDuration
+                self.microphoneAudioLevel = now - self.lastMicrophoneBufferAt < 1
+                    ? (self.microphone?.level ?? 0) : 0
+                self.systemAudioLevel = now - self.lastSystemBufferAt < 1 ? self.systemLevel : 0
+                self.level = max(self.microphoneAudioLevel, self.systemAudioLevel)
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
         }
@@ -380,6 +406,8 @@ final class MeetingRecorder: ObservableObject {
         isRecording = false
         level = 0
         systemLevel = 0
+        microphoneAudioLevel = 0
+        systemAudioLevel = 0
     }
 
     private static func authorizeMicrophone() async throws {
@@ -397,5 +425,10 @@ final class MeetingRecorder: ObservableObject {
 
     private static func hostTime() -> TimeInterval {
         CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+    }
+
+    private static func duration(of buffer: AVAudioPCMBuffer) -> Double {
+        guard buffer.format.sampleRate.isFinite, buffer.format.sampleRate > 0 else { return 0 }
+        return Double(buffer.frameLength) / buffer.format.sampleRate
     }
 }

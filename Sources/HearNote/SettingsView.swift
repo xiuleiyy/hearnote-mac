@@ -107,7 +107,12 @@ struct SettingsView: View {
                                     Text("日本語").tag("ja-JP"); Text("한국어").tag("ko-KR")
                                 }.labelsHidden().frame(width: 180)
                             }
-                            if draft.speechLocale == "zh-en" {
+                            SpeechRecognitionEnginePicker(
+                                selection: $draft.speechEngine, speechLocale: draft.speechLocale
+                            )
+                            Text("中英混合在中文／英文之间识别；English 固定英文，适合全英文会议。识别语言与翻译方向独立设置。")
+                                .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
+                            if draft.usesWhisperRecognition {
                                 MixedSpeechModelControls(
                                     service: state.mixedSpeech, modelVariant: $draft.whisperModel,
                                     isLocked: {
@@ -115,13 +120,11 @@ struct SettingsView: View {
                                             state.translationWorkspace.isUsingSpeech
                                     }
                                 )
+                            } else {
+                                Toggle("允许 Apple 联网语音识别", isOn: $draft.allowCloudRecognition)
+                                Text("Apple 识别依赖 macOS 的 Siri／听写设置。开启联网选项后，音频可能交给 Apple 识别。")
+                                    .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
                             }
-                            Toggle("允许 Apple 联网语音识别", isOn: $draft.allowCloudRecognition)
-                                .disabled(draft.speechLocale == "zh-en")
-                            Text(draft.speechLocale == "zh-en"
-                                 ? "中英混合使用本地多语种模型，保留原语言。翻译选“中英双向”，中文译英文，英文译中文。"
-                                 : "单语优先设备端识别。不支持所选语言的本地识别时会提示你；开启联网选项后，音频可能交给 Apple 识别。")
-                                .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
                             Text("常用专有词（每行一个）").font(.caption.weight(.medium))
                             TextEditor(text: $draft.vocabulary).font(.callout).frame(height: 65)
                                 .padding(5).overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
@@ -202,6 +205,65 @@ struct SettingsView: View {
 }
 
 @MainActor
+struct SpeechRecognitionEnginePicker: View {
+    @Binding var selection: SpeechRecognitionEngine
+    let speechLocale: String
+    var isLocked = false
+
+    private var effectiveSelection: Binding<SpeechRecognitionEngine> {
+        Binding(
+            get: { speechLocale == "zh-en" ? .whisper : selection },
+            set: { selection = $0 }
+        )
+    }
+
+    var body: some View {
+        HStack {
+            Text("识别方式")
+            Spacer()
+            Picker("识别方式", selection: effectiveSelection) {
+                Text("本地 Whisper").tag(SpeechRecognitionEngine.whisper)
+                Text("Apple 语音识别").tag(SpeechRecognitionEngine.apple)
+            }
+            .labelsHidden().frame(width: 200)
+            .disabled(isLocked || speechLocale == "zh-en")
+            .help(speechLocale == "zh-en" ? "中英混合使用本地 Whisper，在中文和英文之间识别。" : "本地 Whisper 无需开启 Siri／听写。")
+        }
+    }
+}
+
+@MainActor
+struct WhisperPreparationStatusView: View {
+    @ObservedObject var service: WhisperSpeechService
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                if service.isPreparing && service.preparationProgress == nil {
+                    ProgressView().controlSize(.small)
+                }
+                Text(service.modelStatus.isEmpty ? "正在准备本地识别模型…" : service.modelStatus)
+                    .lineLimit(2).help(service.modelStatus)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if service.isPreparing || service.preparationElapsed > 0 {
+                    Text("已用 \(AppState.clock(service.preparationElapsed))")
+                        .monospacedDigit().fixedSize()
+                }
+            }
+            if service.isPreparing, let progress = service.preparationProgress {
+                HStack(spacing: 10) {
+                    ProgressView(value: progress, total: 1)
+                    Text("\(Int((progress * 100).rounded()))%")
+                        .monospacedDigit().frame(width: 38, alignment: .trailing)
+                }
+                .help("文件准备进度；模型初始化和编译会显示各自的阶段。")
+            }
+        }
+        .font(.caption).foregroundStyle(.secondary)
+    }
+}
+
+@MainActor
 struct MixedSpeechModelControls: View {
     @ObservedObject var service: WhisperSpeechService
     @Binding var modelVariant: String
@@ -218,7 +280,6 @@ struct MixedSpeechModelControls: View {
                 }.disabled(isLocked() || service.isPreparing)
                 Spacer()
                 if service.isPreparing {
-                    ProgressView().controlSize(.small)
                     Button("取消准备") {
                         preparation?.cancel()
                         service.cancelPreparation()
@@ -230,8 +291,8 @@ struct MixedSpeechModelControls: View {
             }
             Text("首次使用需下载本地语音模型，之后复用。可提前准备；下载不便时可导入完整模型目录。")
                 .font(.caption).foregroundStyle(.secondary).lineSpacing(4)
-            if !service.modelStatus.isEmpty {
-                Text(service.modelStatus).font(.caption).foregroundStyle(.secondary).lineSpacing(4)
+            if service.isPreparing || !service.modelStatus.isEmpty {
+                WhisperPreparationStatusView(service: service)
             }
             if !errorMessage.isEmpty {
                 Text(errorMessage).font(.caption).foregroundStyle(.orange).lineSpacing(4)

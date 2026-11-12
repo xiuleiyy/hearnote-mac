@@ -313,6 +313,7 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
         status = "正在准备本地语音识别…"
         let modelVariant = state.preferences.whisperModel
         let terms = state.preferences.contextualStrings
+        let speechLocale = Self.localeForLanguage(source) ?? "auto"
         let liveRecognizer = state.mixedSpeech.makeLiveRecognizer()
         recognizer = liveRecognizer
         liveRecognizer.onError = { [weak self] error in
@@ -329,7 +330,7 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
                       !state.recorder.isRecording, !state.isBusy else {
                     throw CancellationError()
                 }
-                try await liveRecognizer.start(contextualStrings: terms, source: "语音翻译") {
+                try await liveRecognizer.start(contextualStrings: terms, source: "语音翻译", locale: speechLocale) {
                     [weak self] segment, _ in
                     guard let self, self.voiceID == id else { return }
                     if segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
