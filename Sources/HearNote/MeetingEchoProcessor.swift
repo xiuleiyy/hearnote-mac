@@ -8,24 +8,57 @@ private enum MeetingEchoError: LocalizedError {
     var errorDescription: String? { "音频格式或时间戳无法处理" }
 }
 
-/// The original microphone and system files remain available until mixing succeeds.
 /// Only the microphone's live stream and the replacement microphone track are processed.
+/// The recorder separately archives the original tracks after a successful mix.
 final class MeetingEchoProcessor: @unchecked Sendable {
+    struct AudioFormat: Codable, Sendable {
+        let sampleRate: Double
+        let channels: UInt32
+
+        init(_ format: AVAudioFormat) {
+            sampleRate = format.sampleRate
+            channels = format.channelCount
+        }
+    }
+
+    /// Energy changes include local speech and noise; they do not measure ERLE
+    /// or establish that speaker echo was successfully removed.
+    struct Diagnostics: Codable, Sendable {
+        let microphoneFormat: AudioFormat?
+        let referenceFormat: AudioFormat?
+        let sampleRate: Int
+        let frameSize: Int
+        let writtenSamples: Int64
+        let referenceSamplesMatched: Int64
+        let missingReferenceSamples: Int64
+        let processedSamples: Int64
+        let passthroughSamples: Int64
+        let invalidMicrophoneSamples: Int64
+        let invalidReferenceSamples: Int64
+        let filterResets: Int64
+        let inputRMS: Double?
+        let outputRMS: Double?
+        let referenceRMS: Double?
+    }
+
     struct Result: Sendable {
         let url: URL?
         let firstHostTime: Double?
         let frameCount: Int64
         let referenceSamplesMatched: Int64
         let missingReferenceSamples: Int64
+        let diagnostics: Diagnostics
         let failure: String?
     }
 
     private final class Packet: @unchecked Sendable {
         let buffer: AVAudioPCMBuffer
         let hostTime: Double
+        let arrivedAt: Double
         init(_ buffer: AVAudioPCMBuffer, _ hostTime: Double) {
             self.buffer = buffer
             self.hostTime = hostTime
+            arrivedAt = ProcessInfo.processInfo.systemUptime
         }
     }
 
@@ -33,6 +66,27 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         let start: Int64
         let samples: [Float]
         var end: Int64 { start + Int64(samples.count) }
+    }
+
+    private struct PendingDeadline {
+        var sampleCount: Int
+        let expiresAt: Double
+    }
+
+    private struct Energy {
+        private var sum = 0.0
+        private var samples: Int64 = 0
+
+        mutating func append(_ values: ArraySlice<Float>) {
+            // A nonfinite frame must not make the entire JSON unencodable.
+            guard values.allSatisfy(\.isFinite) else { return }
+            sum += values.reduce(0) { $0 + Double($1) * Double($1) }
+            samples += Int64(values.count)
+        }
+
+        var rms: Double? {
+            samples > 0 ? (sum / Double(samples)).squareRoot() : nil
+        }
     }
 
     static let sampleRate = 16_000
@@ -53,13 +107,24 @@ final class MeetingEchoProcessor: @unchecked Sendable {
     private var referenceConverter: AVAudioConverter?
     private var referenceNextFrame: Int64?
     private var referenceExpectedHostTime: Double?
+    private var microphoneFormat: AudioFormat?
+    private var referenceFormat: AudioFormat?
     private var references: [Reference] = []
     private var pendingMicrophone: [Float] = []
+    private var pendingDeadlines: [PendingDeadline] = []
     private var pendingStart: Int64?
     private var firstWrittenFrame: Int64?
     private var writtenFrames: Int64 = 0
     private var referenceSamplesMatched: Int64 = 0
     private var missingReferenceSamples: Int64 = 0
+    private var processedSamples: Int64 = 0
+    private var passthroughSamples: Int64 = 0
+    private var invalidMicrophoneSamples: Int64 = 0
+    private var invalidReferenceSamples: Int64 = 0
+    private var filterResets: Int64 = 0
+    private var inputEnergy = Energy()
+    private var outputEnergy = Energy()
+    private var referenceEnergy = Energy()
     private var file: AVAudioFile?
     private var failure: String?
     private var finished = false
@@ -112,6 +177,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                     && microphoneExpectedHostTime.map { abs(packet.hostTime - $0) <= 0.002 } == true
                     && microphoneNextFrame.map { abs(stampedStart - $0) <= 80 } == true
                 let samples = try convertedSamples(packet.buffer, reference: false)
+                microphoneFormat = AudioFormat(packet.buffer.format)
                 let start = continuous ? (microphoneNextFrame ?? stampedStart) : stampedStart
                 microphoneExpectedHostTime = packet.hostTime
                     + Double(packet.buffer.frameLength) / packet.buffer.format.sampleRate
@@ -122,11 +188,16 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                     // Device gaps must not concatenate unrelated acoustic histories.
                     drainMicrophone(finishing: true)
                     guard failure == nil else { deliver(packet); return }
-                    canceller.reset()
+                    resetFilter()
                     self.pendingStart = nil
                 }
                 if pendingStart == nil { pendingStart = start }
                 pendingMicrophone.append(contentsOf: samples)
+                // Every frame from this packet shares its arrival deadline.
+                // Capture timestamps can already be old at callback arrival.
+                pendingDeadlines.append(PendingDeadline(
+                    sampleCount: samples.count, expiresAt: packet.arrivedAt + 0.18
+                ))
                 drainMicrophone(finishing: false)
             } catch {
                 degrade(error)
@@ -143,13 +214,14 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                 let continuous = referenceConverter?.inputFormat == packet.buffer.format
                     && referenceExpectedHostTime.map { abs(packet.hostTime - $0) <= 0.002 } == true
                 let samples = try convertedSamples(packet.buffer, reference: true)
+                referenceFormat = AudioFormat(packet.buffer.format)
                 let stampedStart = try frameIndex(packet.hostTime)
                 let start = continuous ? (referenceNextFrame ?? stampedStart) : stampedStart
                 referenceExpectedHostTime = packet.hostTime
                     + Double(packet.buffer.frameLength) / packet.buffer.format.sampleRate
                 referenceNextFrame = start + Int64(samples.count)
                 guard !samples.isEmpty else { return }
-                if !continuous { canceller.reset() }
+                if !continuous { resetFilter() }
                 references.append(Reference(start: start, samples: samples))
                 references.sort { $0.start < $1.start }
                 // Four seconds is a hard bound even if the microphone never delivers.
@@ -177,11 +249,13 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                     finished = true
                     references.removeAll()
                     pendingMicrophone.removeAll()
+                    pendingDeadlines.removeAll()
                     result = Result(
                         url: !isCancelled && failure == nil && writtenFrames > 0 ? url : nil,
                         firstHostTime: firstWrittenFrame.map { epoch + Double($0) / Double(Self.sampleRate) },
                         frameCount: writtenFrames, referenceSamplesMatched: referenceSamplesMatched,
-                        missingReferenceSamples: missingReferenceSamples, failure: failure
+                        missingReferenceSamples: missingReferenceSamples,
+                        diagnostics: diagnostics, failure: failure
                     )
                 }
                 let completed = result!
@@ -312,6 +386,9 @@ final class MeetingEchoProcessor: @unchecked Sendable {
             if !samples.isEmpty {
                 if pendingStart == nil { pendingStart = start }
                 pendingMicrophone.append(contentsOf: samples)
+                pendingDeadlines.append(PendingDeadline(
+                    sampleCount: samples.count, expiresAt: ProcessInfo.processInfo.systemUptime
+                ))
             }
         }
     }
@@ -322,11 +399,11 @@ final class MeetingEchoProcessor: @unchecked Sendable {
             if pendingMicrophone.count < Self.frameSize && !finishing { return }
             let count = min(Self.frameSize, pendingMicrophone.count)
             let reference = referenceFrame(start: start, count: count)
-            let hostTime = epoch + Double(start) / Double(Self.sampleRate)
-            let now = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+            let now = ProcessInfo.processInfo.systemUptime
             // A late reference may arrive before its own buffered microphone is processed.
             // After 180ms, or when stopping, preserve the microphone instead of muting it.
-            if reference == nil, !finishing, now - hostTime < 0.18,
+            if reference == nil, !finishing,
+               let deadline = pendingDeadlines.first, now < deadline.expiresAt,
                pendingMicrophone.count < Self.sampleRate { return }
             var microphone = Array(pendingMicrophone.prefix(count))
             var paddedReference = reference
@@ -339,9 +416,11 @@ final class MeetingEchoProcessor: @unchecked Sendable {
             ).prefix(count))
             if reference == nil { missingReferenceSamples += Int64(count) }
             else { referenceSamplesMatched += Int64(count) }
-            setStatus(reference == nil
-                ? "系统参考暂未就绪，麦克风原音保留"
-                : "外放回声消除已开启")
+            recordDisposition(count: count)
+            inputEnergy.append(microphone.prefix(count))
+            outputEnergy.append(cleaned[...])
+            if let reference { referenceEnergy.append(reference[...]) }
+            setStatus(frameStatus())
             do {
                 try writeAndDeliver(cleaned, start: start)
             } catch {
@@ -349,10 +428,80 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                 return
             }
             pendingMicrophone.removeFirst(count)
+            consumeDeadlines(count)
             pendingStart = start + Int64(count)
             if pendingMicrophone.isEmpty { pendingStart = nil }
             // Retain reference history slightly longer than the adaptive filter.
             references.removeAll { $0.end < start - 8_000 }
+        }
+    }
+
+    private var diagnostics: Diagnostics {
+        Diagnostics(
+            microphoneFormat: microphoneFormat, referenceFormat: referenceFormat,
+            sampleRate: Self.sampleRate, frameSize: Self.frameSize,
+            writtenSamples: writtenFrames, referenceSamplesMatched: referenceSamplesMatched,
+            missingReferenceSamples: missingReferenceSamples, processedSamples: processedSamples,
+            passthroughSamples: passthroughSamples, invalidMicrophoneSamples: invalidMicrophoneSamples,
+            invalidReferenceSamples: invalidReferenceSamples, filterResets: filterResets,
+            inputRMS: inputEnergy.rms, outputRMS: outputEnergy.rms, referenceRMS: referenceEnergy.rms
+        )
+    }
+
+    private func resetFilter() {
+        canceller.reset()
+        filterResets += 1
+    }
+
+    private func recordDisposition(count: Int) {
+        switch canceller.lastFrameDisposition {
+        case .processed:
+            processedSamples += Int64(count)
+        case .invalidMicrophone:
+            invalidMicrophoneSamples += Int64(count)
+            passthroughSamples += Int64(count)
+            filterResets += 1
+        case .invalidReference:
+            invalidReferenceSamples += Int64(count)
+            passthroughSamples += Int64(count)
+            filterResets += 1
+        case .missingReference:
+            passthroughSamples += Int64(count)
+            filterResets += 1
+        case .notProcessed:
+            passthroughSamples += Int64(count)
+        }
+    }
+
+    private func consumeDeadlines(_ count: Int) {
+        var remaining = count
+        while remaining > 0, !pendingDeadlines.isEmpty {
+            let consumed = min(remaining, pendingDeadlines[0].sampleCount)
+            pendingDeadlines[0].sampleCount -= consumed
+            remaining -= consumed
+            if pendingDeadlines[0].sampleCount == 0 { pendingDeadlines.removeFirst() }
+        }
+    }
+
+    private func frameStatus() -> String {
+        let total = Double(max(1, processedSamples + passthroughSamples))
+        let coverage = Int((Double(referenceSamplesMatched) / total * 100).rounded())
+        let processed = Int((Double(processedSamples) / total * 100).rounded())
+        let ratios = "参考覆盖 \(coverage)% · 处理 \(processed)% / 透传 \(100 - processed)%"
+        switch canceller.lastFrameDisposition {
+        case .processed:
+            var change = ""
+            if let input = canceller.lastInputRMS, let output = canceller.lastOutputRMS,
+               input > 0, output > 0 {
+                let attenuation = 20 * log10(input / output)
+                change = String(format: " · 麦克风电平衰减 %.1f dB", attenuation)
+            }
+            let adapting = processedSamples < Int64(Self.sampleRate * 3) ? "（正在适应声音）" : ""
+            return "回声处理中\(adapting) · \(ratios)\(change)"
+        case .missingReference, .notProcessed:
+            return "系统参考暂未就绪，麦克风原音透传 · \(ratios)"
+        case .invalidMicrophone, .invalidReference:
+            return "音频数据异常，麦克风原音透传 · \(ratios)"
         }
     }
 
@@ -423,11 +572,90 @@ final class MeetingEchoProcessor: @unchecked Sendable {
             deliver(Packet(buffer, epoch + Double(start) / Double(Self.sampleRate)))
         }
         pendingMicrophone.removeAll()
+        pendingDeadlines.removeAll()
         pendingStart = nil
         references.removeAll()
-        canceller.reset()
+        resetFilter()
         setStatus(failure!)
     }
 
     deinit { timer?.cancel() }
+}
+
+/// Keeps capture originals independently of the mixed/processed playback file.
+/// A preservation failure never authorizes deletion of the session directory.
+enum OriginalMeetingAudioArchive {
+    struct Track: Codable, Sendable {
+        enum Role: String, Codable, Sendable { case microphone, system, cleanedMicrophone }
+
+        let role: Role
+        let file: String
+        let firstOffsetSeconds: Double?
+        let sampleRate: Double?
+        let channels: UInt32?
+        let samples: Int64?
+
+        init(role: Role, url: URL, firstOffsetSeconds: Double?) {
+            self.role = role
+            file = role == .microphone ? "microphone-original.caf" : url.lastPathComponent
+            self.firstOffsetSeconds = firstOffsetSeconds.flatMap { $0.isFinite ? $0 : nil }
+            let audio = try? AVAudioFile(forReading: url)
+            sampleRate = audio?.processingFormat.sampleRate
+            channels = audio?.processingFormat.channelCount
+            samples = audio?.length
+        }
+    }
+
+    /// Only capture source, time, audio formats, relative filenames and numeric
+    /// processing measurements are saved here. No transcript or error text.
+    struct Metadata: Codable, Sendable {
+        let schemaVersion: Int
+        let capturedAt: Date
+        let recordingSource: String
+        let tracks: [Track]
+        let echo: MeetingEchoProcessor.Diagnostics?
+
+        init(capturedAt: Date, recordingSource: String, tracks: [Track],
+             echo: MeetingEchoProcessor.Diagnostics?) {
+            schemaVersion = 1
+            self.capturedAt = capturedAt
+            self.recordingSource = recordingSource
+            self.tracks = tracks
+            self.echo = echo
+        }
+    }
+
+    static func preserve(
+        sessionDirectory: URL, in recordingsDirectory: URL, sessionID: UUID,
+        microphoneURL: URL?, metadata: Metadata
+    ) throws -> URL {
+        let manager = FileManager.default
+        let archiveRoot = recordingsDirectory.appendingPathComponent("Originals", isDirectory: true)
+        let destination = archiveRoot.appendingPathComponent(sessionID.uuidString, isDirectory: true)
+        // Never merge/replace another session or destroy audio on a collision.
+        guard !manager.fileExists(atPath: destination.path) else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(metadata)
+        try manager.createDirectory(at: archiveRoot, withIntermediateDirectories: true)
+        if let microphoneURL, manager.fileExists(atPath: microphoneURL.path) {
+            let originalURL = sessionDirectory.appendingPathComponent("microphone-original.caf")
+            if microphoneURL.standardizedFileURL != originalURL.standardizedFileURL {
+                // All originals are supplied by this session's recorder.
+                guard microphoneURL.deletingLastPathComponent().standardizedFileURL
+                    == sessionDirectory.standardizedFileURL else {
+                    throw CocoaError(.fileReadInvalidFileName)
+                }
+                try manager.moveItem(at: microphoneURL, to: originalURL)
+            }
+        }
+        try data.write(to: sessionDirectory.appendingPathComponent("diagnostics.json"), options: .atomic)
+        // Moving the whole folder also preserves partial capture files which a
+        // failed source could not return, rather than deleting unknown contents.
+        try manager.moveItem(at: sessionDirectory, to: destination)
+        return destination
+    }
 }

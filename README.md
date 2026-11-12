@@ -19,7 +19,7 @@
 | 功能 | 当前实现 |
 |---|---|
 | 录音来源 | 麦克风、系统声音、同时录制；系统音包含 Zoom、飞书等软件播放的声音 |
-| 外放双源 | 系统声音作为参考，使用本地 SpeexDSP 尝试消除麦克风中的回声；实时识别和保存录音使用处理后的麦克风，参考缺失时保留原音 |
+| 外放双源 | 系统声音作为参考，使用本地 SpeexDSP 尝试消除麦克风中的回声；显示实际处理与参考覆盖状态，参考缺失时透传原音，结束保存后另保留原始音轨 |
 | 实时转写 | 默认本地 WhisperKit；中英混合在中文／英文之间检测；单语可选 Apple，macOS 26 使用新的本地 SpeechAnalyzer |
 | 实时翻译 | Bedrock 文字模型；Whisper 当前句增补并保护常见否定、数字和单位边界；单段失败有限重试后可手动重试，后续段继续；原文修订立即撤下旧译文 |
 | 实时字幕 | 会议直接在主窗口中记录；原文在上、金色译文在下；字幕占据主区域，底部详情可折叠并拖动高度，可跟随最新或暂停回看 |
@@ -106,6 +106,10 @@ bash scripts/build-mac.sh --open
 ## 数据位置
 
 - 笔记和媒体：`~/Library/Application Support/HearNote/`。
+
+- 保存后的录音：`~/Library/Application Support/HearNote/media/`。笔记“导出”菜单可在 Finder 中显示对应录音。
+
+- 新会议的原始音轨：`~/Library/Application Support/HearNote/Recording/Originals/<会话 UUID>/`，按录制时间查找。包含原始麦克风、系统声音和双源处理后的麦克风；只保存在本机，会额外占用磁盘空间。旧版已删除的原音无法补回。详见 [外放回声消除](docs/外放回声消除.md)。
 
 - 独立翻译历史：`~/Library/Application Support/HearNote/translation-history.json`；不含 API Key。
 

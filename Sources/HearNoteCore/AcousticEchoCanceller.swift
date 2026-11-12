@@ -11,9 +11,23 @@ public final class AcousticEchoCanceller {
         case unavailable
     }
 
+    /// Whether the last frame was actually filtered or returned unchanged.
+    public enum FrameDisposition: Equatable {
+        case notProcessed
+        case processed
+        case missingReference
+        case invalidMicrophone
+        case invalidReference
+    }
+
     public let sampleRate: Int
     public let frameSize: Int
     public let filterLength: Int
+
+    public private(set) var lastFrameDisposition: FrameDisposition = .notProcessed
+    public private(set) var lastInputRMS: Double?
+    public private(set) var lastOutputRMS: Double?
+    public private(set) var lastReferenceRMS: Double?
 
     private let state: OpaquePointer
     private var microphonePCM: [Int16]
@@ -56,13 +70,18 @@ public final class AcousticEchoCanceller {
     /// passed through the adaptive canceller rather than discarded.
     public func process(microphone: [Float], reference: [Float]?) -> [Float] {
         guard microphone.count == frameSize,
-              let reference, reference.count == frameSize,
-              microphone.allSatisfy(Self.isNormalized),
+              microphone.allSatisfy(Self.isNormalized) else {
+            return passThrough(microphone, reference: reference,
+                               disposition: .invalidMicrophone)
+        }
+        guard let reference else {
+            return passThrough(microphone, reference: nil,
+                               disposition: .missingReference)
+        }
+        guard reference.count == frameSize,
               reference.allSatisfy(Self.isNormalized) else {
-            // A gap invalidates filter history; stale reference must not remove
-            // microphone speech when the next valid frame arrives.
-            reset()
-            return microphone
+            return passThrough(microphone, reference: reference,
+                               disposition: .invalidReference)
         }
         for index in 0..<frameSize {
             microphonePCM[index] = Self.quantize(microphone[index])
@@ -76,12 +95,50 @@ public final class AcousticEchoCanceller {
                 }
             }
         }
-        return outputPCM.map { Float($0) / 32_768 }
+        let output = outputPCM.map { Float($0) / 32_768 }
+        recordDiagnostics(microphone: microphone, reference: reference,
+                          output: output, disposition: .processed)
+        return output
     }
 
     /// Use after a clock discontinuity, changed audio route or missing reference.
     public func reset() {
         speex_echo_state_reset(state)
+        lastFrameDisposition = .notProcessed
+        lastInputRMS = nil
+        lastOutputRMS = nil
+        lastReferenceRMS = nil
+    }
+
+    private func passThrough(_ microphone: [Float], reference: [Float]?,
+                             disposition: FrameDisposition) -> [Float] {
+        // A gap invalidates filter history; stale reference must not remove
+        // microphone speech when the next valid frame arrives.
+        reset()
+        recordDiagnostics(microphone: microphone, reference: reference,
+                          output: microphone, disposition: disposition)
+        return microphone
+    }
+
+    private func recordDiagnostics(microphone: [Float], reference: [Float]?,
+                                   output: [Float], disposition: FrameDisposition) {
+        lastFrameDisposition = disposition
+        lastInputRMS = Self.rms(microphone)
+        lastOutputRMS = Self.rms(output)
+        lastReferenceRMS = reference.flatMap(Self.rms)
+    }
+
+    /// This is total frame energy, including local speech and background noise.
+    /// The input/output ratio is not an echo-reduction or speech-quality score.
+    private static func rms(_ samples: [Float]) -> Double? {
+        guard !samples.isEmpty else { return 0 }
+        var energy = 0.0
+        for sample in samples {
+            guard sample.isFinite else { return nil }
+            let value = Double(sample)
+            energy += value * value
+        }
+        return (energy / Double(samples.count)).squareRoot()
     }
 
     private static func quantize(_ value: Float) -> Int16 {

@@ -37,6 +37,7 @@ private enum MeetingRecorderError: LocalizedError {
     case busy
     case microphoneDenied
     case noAudio
+    case noAudioRetained(URL)
     case exportFailed(String, URL)
 
     var errorDescription: String? {
@@ -47,6 +48,8 @@ private enum MeetingRecorderError: LocalizedError {
             return "麦克风权限未获允许。请在「系统设置 → 隐私与安全性 → 麦克风」允许听译。"
         case .noAudio:
             return "本次没有录制到音频。请检查所选声音来源和系统权限后重试。"
+        case .noAudioRetained(let recoveryDirectory):
+            return "本次没有可读取的完整音轨，暂时无法生成回放。原始采集文件已保留在 \(recoveryDirectory.path)，可用于恢复或排查。"
         case .exportFailed(let detail, let recoveryDirectory):
             return "会议录音合成失败：\(detail)。原始录音已保留在 \(recoveryDirectory.path)，可用于恢复。"
         }
@@ -67,6 +70,9 @@ final class MeetingRecorder: ObservableObject {
     @Published private(set) var microphoneAudioLevel: Double = 0
     @Published private(set) var systemAudioLevel: Double = 0
     @Published private(set) var echoStatus = ""
+    /// The latest saved session's originals. Starting a new session clears this
+    /// shortcut, while earlier sessions remain in Recording/Originals.
+    @Published private(set) var originalTracksDirectory: URL?
 
     /// These offsets share the timeline used by the final mixed audio file.
     /// Read the corresponding offset inside the first onBuffer callback.
@@ -88,6 +94,7 @@ final class MeetingRecorder: ObservableObject {
     private var sessionDirectory: URL?
     private var outputDirectory: URL?
     private var startedHostTime: TimeInterval = 0
+    private var startedAt = Date()
     private var systemLevel: Double = 0
     private var receivedSystemBuffer = false
     private var capturedMicrophoneDuration: Double = 0
@@ -105,6 +112,7 @@ final class MeetingRecorder: ObservableObject {
         source = requestedSource
         errorMessage = nil
         echoStatus = ""
+        originalTracksDirectory = nil
         elapsed = 0
         level = 0
         systemLevel = 0
@@ -143,6 +151,7 @@ final class MeetingRecorder: ObservableObject {
             if mic != nil { try await Self.authorizeMicrophone() }
             try ensureCurrent(sessionID)
             startedHostTime = Self.hostTime()
+            startedAt = Date()
             let epoch = startedHostTime
             if requestedSource == .both {
                 do {
@@ -166,7 +175,7 @@ final class MeetingRecorder: ObservableObject {
                     system?.onCapturedBuffer = { [processor] pcm, hostTime in
                         processor.appendReference(pcm, hostTime: hostTime)
                     }
-                    echoStatus = "外放回声消除已开启"
+                    echoStatus = "回声处理正在等待系统参考，麦克风原音保留"
                 } catch {
                     echoStatus = "外放回声消除不可用：\(error.localizedDescription)。使用麦克风原音。"
                 }
@@ -297,7 +306,14 @@ final class MeetingRecorder: ObservableObject {
         }
         guard !sources.isEmpty, let temporary, let destination else {
             clearSession(sessionID)
-            if let temporary { try? FileManager.default.removeItem(at: temporary) }
+            if let temporary {
+                // An unreadable/partial CAF may still contain recoverable
+                // capture data. Only explicit user cancellation deletes it.
+                originalTracksDirectory = temporary
+                let recovery = MeetingRecorderError.noAudioRetained(temporary)
+                errorMessage = recovery.localizedDescription
+                throw recovery
+            }
             throw MeetingRecorderError.noAudio
         }
         let output = destination.appendingPathComponent(
@@ -308,7 +324,41 @@ final class MeetingRecorder: ObservableObject {
                 sources: sources, to: output, sessionID: sessionID
             )
             guard generation == sessionID else { throw CancellationError() }
-            try? FileManager.default.removeItem(at: temporary)
+            var tracks: [OriginalMeetingAudioArchive.Track] = []
+            if let microphoneURL {
+                tracks.append(.init(
+                    role: .microphone, url: microphoneURL,
+                    firstOffsetSeconds: microphoneHostTime.map { max(0, $0 - epoch) }
+                ))
+            }
+            if let systemRecording {
+                tracks.append(.init(
+                    role: .system, url: systemRecording.url,
+                    firstOffsetSeconds: systemRecording.firstHostTime.map { max(0, $0 - epoch) }
+                ))
+            }
+            if let cleanedURL = echoRecording?.url {
+                tracks.append(.init(
+                    role: .cleanedMicrophone, url: cleanedURL,
+                    firstOffsetSeconds: echoRecording?.firstHostTime.map { max(0, $0 - epoch) }
+                ))
+            }
+            let metadata = OriginalMeetingAudioArchive.Metadata(
+                capturedAt: startedAt, recordingSource: source.rawValue,
+                tracks: tracks, echo: echoRecording?.diagnostics
+            )
+            do {
+                originalTracksDirectory = try OriginalMeetingAudioArchive.preserve(
+                    sessionDirectory: temporary, in: destination, sessionID: sessionID,
+                    microphoneURL: microphoneURL, metadata: metadata
+                )
+            } catch {
+                // Mixing succeeded. Keep its output and every original in the
+                // temporary folder if archiving fails; never delete that folder.
+                originalTracksDirectory = temporary
+                let warning = "录音已保存；原音归档未完成，原始录音仍保留在 \(temporary.path)。"
+                errorMessage = errorMessage.map { "\($0)\n\(warning)" } ?? warning
+            }
             clearSession(sessionID)
             return output
         } catch {
@@ -319,6 +369,7 @@ final class MeetingRecorder: ObservableObject {
                 throw CancellationError()
             }
             // Do not discard original audio when export or storage fails.
+            originalTracksDirectory = temporary
             let recovery = MeetingRecorderError.exportFailed(
                 error.localizedDescription, temporary
             )

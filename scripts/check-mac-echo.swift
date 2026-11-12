@@ -33,10 +33,17 @@ struct MacEchoHarness {
         try await conversionWithoutReference(rate: 48_000, chunk: 1_024, root: root)
         try await continuousReference(referenceRate: 48_000, microphoneRate: 44_100, root: root)
         try await continuousReference(referenceRate: 44_100, microphoneRate: 48_000, root: root)
-        try await lateReference(root: root)
+        try await lateReference(captureAge: 0, root: root)
+        try await lateReference(captureAge: 0.25, root: root)
+        try await wholePacketDeadline(root: root)
+        try await invalidReference(value: 2, name: "out-of-range", root: root)
+        try await invalidReference(value: .nan, name: "nonfinite", root: root)
+        try await simultaneousSpeech(root: root)
         try await stopTail(root: root)
         try await cancelIsolation(root: root)
-        print("Mac echo integration: 7 synthetic checks passed; no microphone, model, or API permission used.")
+        try originalTracksPersist(root: root)
+        try originalTracksPreservedOnArchiveFailure(root: root)
+        print("Mac echo integration: 14 synthetic checks passed; no microphone, model, or API permission used.")
     }
 
     static func hostNow() -> Double {
@@ -102,7 +109,9 @@ struct MacEchoHarness {
         let interior = collector.samples.dropFirst(200).dropLast(200)
         try require(!interior.isEmpty, "\(name): no output")
         try require(interior.allSatisfy { abs($0 - 0.12) < 0.005 }, "\(name): original near voice changed")
-        try require(collector.statuses.contains("系统参考暂未就绪，麦克风原音保留"), "\(name): fallback not visible")
+        try require(collector.statuses.contains { $0.hasPrefix("系统参考暂未就绪") }, "\(name): fallback not visible")
+        try require(result.diagnostics.processedSamples == 0, "\(name): pass-through marked processed")
+        try require(result.diagnostics.passthroughSamples == result.frameCount, "\(name): pass-through count")
     }
 
     @MainActor
@@ -131,8 +140,8 @@ struct MacEchoHarness {
         }
         let result = await processor.finish()
         try verifyFile(result, collector: collector, expected: 32_000, name: name)
-        try require(collector.statuses.contains("外放回声消除已开启"), "\(name): no reference matched")
-        try require(!collector.statuses.contains("系统参考暂未就绪，麦克风原音保留"),
+        try require(collector.statuses.contains { $0.hasPrefix("回声处理中") }, "\(name): no reference matched")
+        try require(!collector.statuses.contains { $0.hasPrefix("系统参考暂未就绪") },
                     "\(name): continuous resampling created a reference hole")
         try require(result.missingReferenceSamples == 0,
                     "\(name): frame-internal reference holes bypassed cancellation")
@@ -142,22 +151,97 @@ struct MacEchoHarness {
     }
 
     @MainActor
-    static func lateReference(root: URL) async throws {
+    static func lateReference(captureAge: Double, root: URL) async throws {
         let collector = Collector()
-        let epoch = hostNow()
-        let processor = try processor(name: "late-reference", root: root, epoch: epoch, collector: collector)
+        let epoch = hostNow() - captureAge
+        let name = captureAge > 0 ? "late-capture-late-reference" : "late-reference"
+        let processor = try processor(name: name, root: root, epoch: epoch, collector: collector)
         let pcm = try buffer(rate: 16_000, start: 0, count: 320) {
             Float(0.1 * sin(2 * .pi * 400 * $0))
         }
         processor.appendMicrophone(pcm, hostTime: epoch)
         // Leave scheduling margin below the real-time 180ms fallback deadline.
         try await Task.sleep(nanoseconds: 80_000_000)
-        try require(collector.samples.isEmpty, "late-reference: microphone processed before bounded wait")
+        try require(collector.samples.isEmpty, "\(name): capture age consumed the reference-arrival budget")
         processor.appendReference(pcm, hostTime: epoch)
         let result = await processor.finish()
-        try verifyFile(result, collector: collector, expected: 320, name: "late-reference")
-        try require(collector.statuses.contains("外放回声消除已开启"), "late-reference: late reference not used")
-        try require(!collector.statuses.contains("系统参考暂未就绪，麦克风原音保留"), "late-reference: early fallback")
+        try verifyFile(result, collector: collector, expected: 320, name: name)
+        try require(result.diagnostics.processedSamples == 320, "\(name): late reference not used")
+        try require(result.missingReferenceSamples == 0, "\(name): early fallback")
+        try require(collector.statuses.contains { $0.hasPrefix("回声处理中") }, "\(name): processing status")
+    }
+
+    @MainActor
+    static func wholePacketDeadline(root: URL) async throws {
+        let collector = Collector()
+        let epoch = hostNow() - 0.25
+        let processor = try processor(name: "whole-packet-deadline", root: root, epoch: epoch, collector: collector)
+        let pcm = try buffer(rate: 16_000, start: 0, count: 8_000) { _ in 0.12 }
+        processor.appendMicrophone(pcm, hostTime: epoch)
+        try await Task.sleep(nanoseconds: 80_000_000)
+        try require(collector.samples.isEmpty, "whole-packet-deadline: old capture timestamp skipped waiting")
+        // All 25 frames have the same deadline, rather than taking 25 * 180ms.
+        try await Task.sleep(nanoseconds: 240_000_000)
+        try require(collector.samples.count == 8_000, "whole-packet-deadline: frame-by-frame wait accumulated")
+        let result = await processor.finish()
+        try verifyFile(result, collector: collector, expected: 8_000, name: "whole-packet-deadline")
+        try require(result.diagnostics.passthroughSamples == 8_000, "whole-packet-deadline: fail-open count")
+        try require(collector.samples.allSatisfy { abs($0 - 0.12) < 0.0001 },
+                    "whole-packet-deadline: local voice was muted")
+    }
+
+    @MainActor
+    static func invalidReference(value: Float, name: String, root: URL) async throws {
+        let collector = Collector()
+        let epoch = hostNow()
+        let processor = try processor(name: name, root: root, epoch: epoch, collector: collector)
+        let ref = try buffer(rate: 16_000, start: 0, count: 320) { _ in value }
+        let mic = try buffer(rate: 16_000, start: 0, count: 320) { _ in 0.12 }
+        processor.appendReference(ref, hostTime: epoch)
+        processor.appendMicrophone(mic, hostTime: epoch)
+        let result = await processor.finish()
+        try verifyFile(result, collector: collector, expected: 320, name: name)
+        try require(result.referenceSamplesMatched == 320, "\(name): reference coverage")
+        try require(result.diagnostics.processedSamples == 0, "\(name): invalid reference marked processed")
+        try require(result.diagnostics.invalidReferenceSamples == 320, "\(name): invalid-reference count")
+        try require(collector.statuses.contains { $0.hasPrefix("音频数据异常") }, "\(name): false active status")
+        try require(collector.samples.allSatisfy { abs($0 - 0.12) < 0.0001 }, "\(name): fail-open changed microphone")
+        _ = try JSONEncoder().encode(result.diagnostics)
+    }
+
+    @MainActor
+    static func simultaneousSpeech(root: URL) async throws {
+        let collector = Collector()
+        let epoch = hostNow()
+        let processor = try processor(name: "double-talk-from-start", root: root, epoch: epoch, collector: collector)
+        let rate = 16_000
+        func far(_ time: Double) -> Float {
+            guard time >= 0 else { return 0 }
+            return Float(0.19 * sin(2 * .pi * 310 * time)
+                         + 0.09 * sin(2 * .pi * 470 * time)
+                         + 0.04 * sin(2 * .pi * 610 * time))
+        }
+        func near(_ time: Double) -> Float {
+            Float(0.020 * sin(2 * .pi * 870 * time) + 0.011 * sin(2 * .pi * 1_090 * time))
+        }
+        for start in stride(from: 0, to: rate * 3, by: 320) {
+            let ref = try buffer(rate: Double(rate), start: start, count: 320, value: far)
+            let mic = try buffer(rate: Double(rate), start: start, count: 320) {
+                0.38 * far($0 - 0.08) + near($0)
+            }
+            processor.appendReference(ref, hostTime: epoch + Double(start) / Double(rate))
+            processor.appendMicrophone(mic, hostTime: epoch + Double(start) / Double(rate))
+        }
+        let result = await processor.finish()
+        try verifyFile(result, collector: collector, expected: rate * 3, name: "double-talk-from-start")
+        try require(result.diagnostics.processedSamples == Int64(rate * 3), "double-talk-from-start: filtering gaps")
+        let local = (0..<rate).map { Double(near(Double($0) / Double(rate))) }
+        let inputEnergy = local.reduce(0) { $0 + $1 * $1 }
+        let projection = zip(collector.samples.prefix(rate), local).reduce(0.0) {
+            $0 + Double($1.0) * $1.1
+        } / inputEnergy
+        try require(projection > 0.75, "double-talk-from-start: weak local speech lost during convergence")
+        try require(collector.samples.allSatisfy(\.isFinite), "double-talk-from-start: nonfinite output")
     }
 
     @MainActor
@@ -189,5 +273,99 @@ struct MacEchoHarness {
         processor.appendReference(pcm, hostTime: epoch)
         let result = await processor.finish()
         try require(result.url == nil && collector.samples.isEmpty, "cancel: late output escaped generation")
+    }
+
+    static func originalTracksPersist(root: URL) throws {
+        let sessionID = UUID()
+        let recordings = root.appendingPathComponent("archive-success", isDirectory: true)
+        let session = recordings.appendingPathComponent(".meeting-\(sessionID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+        let microphone = session.appendingPathComponent("recording-synthetic.caf")
+        let system = session.appendingPathComponent("system.caf")
+        let cleaned = session.appendingPathComponent("microphone-cleaned.caf")
+        for (url, value) in [(microphone, Float(0.12)), (system, Float(0.23)), (cleaned, Float(0.03))] {
+            let pcm = try buffer(rate: 16_000, start: 0, count: 320) { _ in value }
+            let audio = try AVAudioFile(forWriting: url, settings: pcm.format.settings,
+                                        commonFormat: .pcmFormatFloat32, interleaved: false)
+            try audio.write(from: pcm)
+        }
+        let microphoneBytes = try Data(contentsOf: microphone)
+        let systemBytes = try Data(contentsOf: system)
+        let tracks = [
+            OriginalMeetingAudioArchive.Track(role: .microphone, url: microphone, firstOffsetSeconds: 0.03),
+            OriginalMeetingAudioArchive.Track(role: .system, url: system, firstOffsetSeconds: 0),
+            OriginalMeetingAudioArchive.Track(role: .cleanedMicrophone, url: cleaned, firstOffsetSeconds: 0.03)
+        ]
+        let metadata = OriginalMeetingAudioArchive.Metadata(
+            capturedAt: Date(timeIntervalSince1970: 0), recordingSource: "both", tracks: tracks, echo: nil
+        )
+        let archived = try OriginalMeetingAudioArchive.preserve(
+            sessionDirectory: session, in: recordings, sessionID: sessionID,
+            microphoneURL: microphone, metadata: metadata
+        )
+        try require(!FileManager.default.fileExists(atPath: session.path), "archive: old session still present")
+        try require(archived.lastPathComponent == sessionID.uuidString, "archive: wrong session directory")
+        let archivedMicrophone = try Data(contentsOf: archived.appendingPathComponent("microphone-original.caf"))
+        let archivedSystem = try Data(contentsOf: archived.appendingPathComponent("system.caf"))
+        try require(archivedMicrophone == microphoneBytes,
+                    "archive: original microphone discarded or modified")
+        try require(archivedSystem == systemBytes,
+                    "archive: original system track modified")
+        try require(FileManager.default.fileExists(atPath: archived.appendingPathComponent("microphone-cleaned.caf").path),
+                    "archive: processed track missing")
+        let data = try Data(contentsOf: archived.appendingPathComponent("diagnostics.json"))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(OriginalMeetingAudioArchive.Metadata.self, from: data)
+        try require(decoded.tracks.count == 3 && decoded.schemaVersion == 1, "archive: missing format diagnostics")
+        try require(decoded.tracks[0].samples == 320 && decoded.tracks[0].sampleRate == 16_000,
+                    "archive: original format metadata")
+    }
+
+    static func originalTracksPreservedOnArchiveFailure(root: URL) throws {
+        let sessionID = UUID()
+        let recordings = root.appendingPathComponent("archive-failure", isDirectory: true)
+        let session = recordings.appendingPathComponent(".meeting-\(sessionID.uuidString)", isDirectory: true)
+        let existing = recordings.appendingPathComponent("Originals/\(sessionID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: existing, withIntermediateDirectories: true)
+        let microphone = session.appendingPathComponent("recording-synthetic.caf")
+        let bytes = Data([0, 1, 2, 3])
+        try bytes.write(to: microphone)
+        let metadata = OriginalMeetingAudioArchive.Metadata(
+            capturedAt: Date(timeIntervalSince1970: 0), recordingSource: "microphone", tracks: [], echo: nil
+        )
+        var failed = false
+        do {
+            _ = try OriginalMeetingAudioArchive.preserve(
+                sessionDirectory: session, in: recordings, sessionID: sessionID,
+                microphoneURL: microphone, metadata: metadata
+            )
+        } catch { failed = true }
+        try require(failed, "archive-failure: existing session overwritten")
+        let preservedBytes = try Data(contentsOf: microphone)
+        try require(preservedBytes == bytes, "archive-failure: originals deleted on error")
+
+        // Also fail after the original microphone has been renamed, proving
+        // that a later metadata-write error keeps the recoverable session.
+        let nextID = UUID()
+        let nextSession = recordings.appendingPathComponent(".meeting-\(nextID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: nextSession, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: nextSession.appendingPathComponent("diagnostics.json", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let nextMicrophone = nextSession.appendingPathComponent("recording-synthetic.caf")
+        try bytes.write(to: nextMicrophone)
+        failed = false
+        do {
+            _ = try OriginalMeetingAudioArchive.preserve(
+                sessionDirectory: nextSession, in: recordings, sessionID: nextID,
+                microphoneURL: nextMicrophone, metadata: metadata
+            )
+        } catch { failed = true }
+        try require(failed, "archive-failure: metadata collision not reported")
+        let renamedBytes = try Data(contentsOf: nextSession.appendingPathComponent("microphone-original.caf"))
+        try require(renamedBytes == bytes, "archive-failure: renamed original deleted on later error")
     }
 }

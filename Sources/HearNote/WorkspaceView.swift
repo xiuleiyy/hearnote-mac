@@ -1,4 +1,5 @@
 #if os(macOS)
+import AppKit
 import SwiftUI
 import AVKit
 import HearNoteCore
@@ -291,6 +292,21 @@ struct DocumentView: View {
                             Button("字幕 .srt") { state.exportSelected("srt") }
                             Button("笔记 .md") { state.exportSelected("md") }
                             Button("完整记录 .json") { state.exportSelected("json") }
+                            if let filename = document.mediaFilename {
+                                Divider()
+                                Button("在 Finder 中显示录音") {
+                                    NSWorkspace.shared.activateFileViewerSelecting(
+                                        [state.repository.mediaURL(filename: filename)]
+                                    )
+                                }
+                            }
+                            if document.sourceKind == .recording,
+                               FileManager.default.fileExists(atPath: originalTracksRoot.path) {
+                                Button("打开原始音轨总目录") {
+                                    NSWorkspace.shared.open(originalTracksRoot)
+                                }
+                                .help("各场会议按文件夹保存；按录制时间找到原始麦克风、系统声音和处理后的麦克风。")
+                            }
                         } label: { Label("导出", systemImage: "square.and.arrow.up") }.fixedSize()
                     }
                     HStack(spacing: 13) {
@@ -362,6 +378,9 @@ struct DocumentView: View {
             }
             .onAppear { state.select(document) }
         }
+    }
+    private var originalTracksRoot: URL {
+        state.root.appendingPathComponent("Recording/Originals", isDirectory: true)
     }
     private var detailPicker: some View {
         Picker("内容", selection: $state.detailTab) {
