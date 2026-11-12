@@ -314,6 +314,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
     }
 
     private func convertedSamples(_ buffer: AVAudioPCMBuffer, reference: Bool) throws -> [Float] {
+        guard buffer.frameLength > 0 else { return [] }
         var converter = reference ? referenceConverter : microphoneConverter
         if converter?.inputFormat != buffer.format {
             guard buffer.format.sampleRate > 0, buffer.format.channelCount > 0,
@@ -324,27 +325,70 @@ final class MeetingEchoProcessor: @unchecked Sendable {
             converter = next
             if reference { referenceConverter = next } else { microphoneConverter = next }
         }
-        guard let converter, let output = AVAudioPCMBuffer(
-            pcmFormat: format,
-            frameCapacity: AVAudioFrameCount(ceil(Double(buffer.frameLength)
-                * Double(Self.sampleRate) / buffer.format.sampleRate) + 64)
-        ) else { throw MeetingEchoError.invalidAudio }
-        var supplied = false
-        var error: NSError?
-        let state = converter.convert(to: output, error: &error) { _, inputStatus in
-            guard !supplied else {
-                inputStatus.pointee = .noDataNow
-                return nil
-            }
-            supplied = true
-            inputStatus.pointee = .haveData
-            return buffer
-        }
-        guard state != .error, error == nil, let data = output.floatChannelData?[0] else {
-            if let error { throw error }
+        guard let converter,
+              let input = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength),
+              let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1_600) else {
             throw MeetingEchoError.invalidAudio
         }
-        return Array(UnsafeBufferPointer(start: data, count: Int(output.frameLength)))
+        let source = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        let destination = UnsafeMutableAudioBufferListPointer(input.mutableAudioBufferList)
+        let bytesPerFrame = Int(buffer.format.streamDescription.pointee.mBytesPerFrame)
+        let expectedFrames = ceil(Double(buffer.frameLength)
+            * Double(Self.sampleRate) / buffer.format.sampleRate)
+        guard bytesPerFrame > 0, source.count == destination.count,
+              expectedFrames.isFinite, expectedFrames <= Double(UInt32.max),
+              source.allSatisfy({
+                  $0.mData != nil && Int($0.mDataByteSize) / bytesPerFrame >= Int(buffer.frameLength)
+              }) else {
+            throw MeetingEchoError.invalidAudio
+        }
+        var suppliedFrames = 0
+        var invalidInput = false
+        var samples: [Float] = []
+        // A live packet is not EOS. Supply each requested input slice once and
+        // drain all available output, including output buffered between calls.
+        // The bound covers this packet plus a small previous resampling tail.
+        let maximumCalls = Int(ceil(expectedFrames / Double(output.frameCapacity))) + 4
+        for _ in 0..<maximumCalls {
+            output.frameLength = 0
+            var error: NSError?
+            let state = converter.convert(to: output, error: &error) { requestedFrames, inputStatus in
+                let count = min(Int(requestedFrames), Int(buffer.frameLength) - suppliedFrames)
+                guard count > 0 else {
+                    inputStatus.pointee = .noDataNow
+                    return nil
+                }
+                let byteOffset = suppliedFrames * bytesPerFrame
+                let byteCount = count * bytesPerFrame
+                for index in source.indices {
+                    guard byteOffset + byteCount <= Int(source[index].mDataByteSize),
+                          let sourceData = source[index].mData,
+                          let destinationData = destination[index].mData else {
+                        invalidInput = true
+                        inputStatus.pointee = .noDataNow
+                        return nil
+                    }
+                    destinationData.copyMemory(from: sourceData.advanced(by: byteOffset), byteCount: byteCount)
+                }
+                suppliedFrames += count
+                input.frameLength = AVAudioFrameCount(count)
+                inputStatus.pointee = .haveData
+                return input
+            }
+            if let error { throw error }
+            guard !invalidInput, state != .error, state != .endOfStream,
+                  let data = output.floatChannelData?[0] else {
+                throw MeetingEchoError.invalidAudio
+            }
+            samples.append(contentsOf: UnsafeBufferPointer(start: data, count: Int(output.frameLength)))
+            if state == .inputRanDry, output.frameLength == 0 {
+                guard suppliedFrames == Int(buffer.frameLength) else {
+                    throw MeetingEchoError.invalidAudio
+                }
+                return samples
+            }
+        }
+        throw MeetingEchoError.invalidAudio
     }
 
     private func referenceFrame(start: Int64, count: Int) -> [Float]? {

@@ -62,6 +62,8 @@ struct MacEchoHarness {
         try await lateReference(captureAge: 0, root: root)
         try await lateReference(captureAge: 0.25, root: root)
         try await wholePacketDeadline(root: root)
+        try await largePacketConversion(rate: 44_100, root: root)
+        try await largePacketConversion(rate: 48_000, root: root)
         try await invalidReference(value: 2, name: "out-of-range", root: root)
         try await invalidReference(value: .nan, name: "nonfinite", root: root)
         try await simultaneousSpeech(root: root)
@@ -69,7 +71,7 @@ struct MacEchoHarness {
         try await cancelIsolation(root: root)
         try originalTracksPersist(root: root)
         try originalTracksPreservedOnArchiveFailure(root: root)
-        print("Mac echo integration: 14 synthetic checks passed; no microphone, model, or API permission used.")
+        print("Mac echo integration: 16 synthetic checks passed; no microphone, model, or API permission used.")
     }
 
     static func hostNow() -> Double {
@@ -250,12 +252,42 @@ struct MacEchoHarness {
         let finishMilliseconds = Int((ProcessInfo.processInfo.systemUptime - realStart) * 1_000)
         diagnostic("whole-packet-deadline clock=logical logicalMs=181 finishedSamples=\(collector.samples.count) writtenSamples=\(result.frameCount) deliveredByFinish=\(collector.samples.count - liveSamples) passthroughSamples=\(result.diagnostics.passthroughSamples) realElapsedMs=\(finishMilliseconds)")
         try require(liveSamples >= requiredLive && liveSamples <= expected && liveSamples % frameSize == 0,
-                    "whole-packet-deadline: frame-by-frame wait accumulated; actual=\(liveSamples), required=\(requiredLive)...\(expected), logicalMs=181, realElapsedMs=\(elapsedMilliseconds)")
+                    "whole-packet-deadline: complete frames unavailable after shared deadline; actual=\(liveSamples), required=\(requiredLive)...\(expected), logicalMs=181, realElapsedMs=\(elapsedMilliseconds)")
         try verifyFile(result, collector: collector, expected: expected, name: "whole-packet-deadline")
         try require(result.diagnostics.passthroughSamples == result.frameCount,
                     "whole-packet-deadline: fail-open count; actual=\(result.diagnostics.passthroughSamples), written=\(result.frameCount)")
         try require(collector.samples.allSatisfy { abs($0 - 0.12) < 0.0001 },
                     "whole-packet-deadline: local voice was muted")
+    }
+
+    @MainActor
+    static func largePacketConversion(rate: Int, root: URL) async throws {
+        let collector = Collector()
+        let clock = TestClock()
+        let epoch = hostNow()
+        let name = "large-packet-\(rate)"
+        let processor = try processor(name: name, root: root, epoch: epoch, collector: collector, clock: clock)
+        let expected = 8_000
+        let requiredLive = expected - MeetingEchoProcessor.frameSize
+        let pcm = try buffer(rate: Double(rate), start: 0, count: rate / 2) { _ in 0.12 }
+        processor.appendMicrophone(pcm, hostTime: epoch)
+        await processor.synchronize()
+        try require(collector.samples.isEmpty,
+                    "\(name): skipped reference wait; actual=\(collector.samples.count)")
+        clock.advance(to: 0.181)
+        await processor.synchronize()
+        let liveSamples = collector.samples.count
+        let result = await processor.finish()
+        diagnostic("\(name) clock=logical logicalMs=181 beforeFinishSamples=\(liveSamples) requiredLive=\(requiredLive) finishedSamples=\(collector.samples.count) deliveredByFinish=\(collector.samples.count - liveSamples)")
+        try require(liveSamples >= requiredLive && liveSamples <= expected
+                    && liveSamples % MeetingEchoProcessor.frameSize == 0,
+                    "\(name): complete frames unavailable after shared deadline; actual=\(liveSamples), required=\(requiredLive)...\(expected), logicalMs=181")
+        try verifyFile(result, collector: collector, expected: expected, name: name)
+        try require(result.diagnostics.passthroughSamples == result.frameCount,
+                    "\(name): pass-through count")
+        let interior = collector.samples.dropFirst(200).dropLast(200)
+        try require(!interior.isEmpty && interior.allSatisfy { abs($0 - 0.12) < 0.005 },
+                    "\(name): original near voice changed")
     }
 
     @MainActor
