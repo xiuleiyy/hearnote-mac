@@ -689,6 +689,7 @@ struct RecordingView: View {
                       systemImage: "sparkles")
                     .font(.caption).foregroundStyle(.secondary)
                 RecordingAudioStatusView(recorder: state.recorder)
+                RecordingEchoStatusView(recorder: state.recorder, expanded: true)
                 if state.isPreparingMeetingRecognition {
                     Text("录音继续保存；模型就绪后识别新声音，准备期间的音频可在会后重新转写。")
                         .font(.caption).foregroundStyle(.secondary)
@@ -741,6 +742,7 @@ struct RecordingView: View {
                     .lineLimit(1).help(state.liveTranslationStatus)
             }
             .font(.caption2).foregroundStyle(.secondary)
+            RecordingEchoStatusView(recorder: state.recorder)
             if state.isPreparingMeetingRecognition {
                 HStack(alignment: .top, spacing: 12) {
                     if state.preferences.usesWhisperRecognition {
@@ -851,7 +853,7 @@ struct RecordingView: View {
     private var recordingActions: some View {
         HStack {
             if !meetingIsActive {
-                Text("可以戴耳机，减少麦克风重复收录会议声音。").font(.caption).foregroundStyle(.secondary)
+                Text("双源录音会尝试消除外放回声；耳机可进一步减少串音。").font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             recordingButton
@@ -875,6 +877,22 @@ struct RecordingView: View {
                 Label("开始录音", systemImage: "mic.fill")
             }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
                 .disabled(state.isBusy || state.isQuitting).fixedSize()
+        }
+    }
+}
+
+@MainActor
+private struct RecordingEchoStatusView: View {
+    @ObservedObject var recorder: MeetingRecorder
+    var expanded = false
+
+    var body: some View {
+        if !recorder.echoStatus.isEmpty {
+            Label(recorder.echoStatus, systemImage: "waveform.path")
+                .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(expanded ? nil : 1)
+                .help(recorder.echoStatus)
+                .textSelection(.enabled)
         }
     }
 }

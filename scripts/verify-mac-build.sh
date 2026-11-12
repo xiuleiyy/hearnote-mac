@@ -16,6 +16,10 @@ codesign --verify --strict "$hearnote_app_path"
 codesign -dvv "$hearnote_app_path" 2>&1
 xcrun vtool -show-build "$hearnote_binary"
 otool -L "$hearnote_binary"
+cmp "$hearnote_project_root/Sources/CSpeexDSP/COPYING" \
+    "$hearnote_app_path/Contents/Resources/ThirdPartyLicenses/SpeexDSP.txt"
+cmp "$hearnote_project_root/Resources/ThirdPartyLicenses/KISS-FFT.txt" \
+    "$hearnote_app_path/Contents/Resources/ThirdPartyLicenses/KISS-FFT.txt"
 
 python3 - "$hearnote_binary" "$hearnote_app_path" <<'PY'
 import plistlib, re, subprocess, sys

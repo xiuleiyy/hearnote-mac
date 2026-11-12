@@ -1,0 +1,23 @@
+{
+  "project": "SpeexDSP",
+  "repository": "https://github.com/xiph/speexdsp",
+  "tag": "SpeexDSP-1.2.1",
+  "revision": "1b28a0f61bc31162979e1f26f3981fc3637095c8",
+  "sha256": {
+    "COPYING": "2654a4264b2bfe298dedc508748d140111840c315cc8eb646a3a68c13fa75b01",
+    "libspeexdsp/mdf.c": "a096297873dfd0a07509028d2cdd02d12edf8f1d03319fcecedda003d18d22a8",
+    "libspeexdsp/fftwrap.c": "a59ec583e5660207da9cf3c1ddd6a7ff1ed91382eb40df2a4e77d5cddfe14c52",
+    "libspeexdsp/fftwrap.h": "fd289dcc47b9ddb2b33039c1990c4644bb279c9413ede6e74fdb2742c3888ee5",
+    "libspeexdsp/arch.h": "102f6a14a95f8ae0bcfc69270f3a9e3fbba08b63bba688ca524f71e3faa48c23",
+    "libspeexdsp/pseudofloat.h": "0bd544dbed0096e02da2fd800d673bafb19bd97f56e268b98402ad641726daae",
+    "libspeexdsp/math_approx.h": "a024693b0d29dc4e904021a1b442908c1fa726b18f5d31b0935e38646f2701ff",
+    "libspeexdsp/os_support.h": "5ab9c979e8ac1f72c7441d24e39e7840828dd9356aac49a31eabeddb808bf1d3",
+    "libspeexdsp/kiss_fft.c": "61574b6ceff29423a12cda1928b2ae09c89d316ffd1881a207aa74c3dc97da3f",
+    "libspeexdsp/kiss_fft.h": "61c31ff4a2002186086c8b7efa14cc28af733741175056abad95d985c2ecf3ae",
+    "libspeexdsp/kiss_fftr.c": "13b7ec32c17b927e0978195ce9eeb09e9791b236fcee94b807fd0086d14cb25e",
+    "libspeexdsp/kiss_fftr.h": "2f6ef60fa5900508d8aa0d303a27cae6c1f17a6620a4e174d51f0ff8adc18bf2",
+    "libspeexdsp/_kiss_fft_guts.h": "a375fe2c2006fa18605a9e75431a537101caf4084b614d33240068bb1f475c86",
+    "include/speex/speex_echo.h": "ab18db97564a241c9e06d723351c2155bf04a23ac30e0c27a3d86dcc04de3426",
+    "include/speex/speexdsp_types.h": "4f97187c057fd8493c787f2526752859cf57007d50fef8d2e03c9b79b2fed490"
+  }
+}

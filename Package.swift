@@ -4,7 +4,23 @@ import PackageDescription
 var products: [Product] = [.library(name: "HearNoteCore", targets: ["HearNoteCore"])]
 var dependencies: [Package.Dependency] = []
 var targets: [Target] = [
-    .target(name: "HearNoteCore"),
+    .target(
+        name: "CSpeexDSP",
+        exclude: ["COPYING", "README.md", "upstream.json"],
+        sources: [
+            "libspeexdsp/mdf.c", "libspeexdsp/fftwrap.c",
+            "libspeexdsp/kiss_fft.c", "libspeexdsp/kiss_fftr.c"
+        ],
+        publicHeadersPath: "include",
+        cSettings: [
+            .headerSearchPath("libspeexdsp"),
+            .define("FLOATING_POINT"),
+            .define("USE_KISS_FFT"),
+            .define("EXPORT", to: "")
+        ],
+        linkerSettings: [.linkedLibrary("m", .when(platforms: [.linux]))]
+    ),
+    .target(name: "HearNoteCore", dependencies: ["CSpeexDSP"]),
     .testTarget(name: "HearNoteCoreTests", dependencies: ["HearNoteCore"])
 ]
 #if os(macOS)

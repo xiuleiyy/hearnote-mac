@@ -214,6 +214,7 @@ final class AudioRecorder: NSObject, ObservableObject {
     private(set) var firstBufferHostTime: Double?
 
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
+    var onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, Double) -> Void)?
     var onError: ((Error) -> Void)?
 
     private var engine: AVAudioEngine?
@@ -256,7 +257,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw MediaServiceError.recordingUnavailable
         }
-        let newSink = try RecordingSink(url: url, format: format)
+        let newSink = try RecordingSink(url: url, format: format, onCapturedBuffer: onCapturedBuffer)
         let id = UUID()
         errorMessage = nil
         elapsed = 0
@@ -320,6 +321,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         let url = sink?.url
+        if firstBufferHostTime == nil { firstBufferHostTime = sink?.capturedStartHostTime }
         sink?.close()
         sink = nil
         self.engine = nil
@@ -370,9 +372,12 @@ private final class RecordingSink: @unchecked Sendable {
     private let sampleRate: Double
     private var firstHostTime: Double?
     private var failed = false
+    private let onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, Double) -> Void)?
 
-    init(url: URL, format: AVAudioFormat) throws {
+    init(url: URL, format: AVAudioFormat,
+         onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, Double) -> Void)? = nil) throws {
         self.url = url
+        self.onCapturedBuffer = onCapturedBuffer
         sampleRate = format.sampleRate
         file = try AVAudioFile(forWriting: url, settings: format.settings,
                                commonFormat: format.commonFormat, interleaved: format.isInterleaved)
@@ -398,7 +403,9 @@ private final class RecordingSink: @unchecked Sendable {
             }
             try file.write(from: buffer)
             frames += AVAudioFramePosition(buffer.frameLength)
-            return Result(buffer: Self.copy(buffer), level: Self.rms(buffer),
+            let copied = Self.copy(buffer)
+            if let copied { onCapturedBuffer?(copied, hostTime) }
+            return Result(buffer: copied, level: Self.rms(buffer),
                           elapsed: Double(frames) / sampleRate, error: nil)
         } catch {
             failed = true
@@ -411,6 +418,12 @@ private final class RecordingSink: @unchecked Sendable {
         lock.lock()
         file = nil
         lock.unlock()
+    }
+
+    var capturedStartHostTime: Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return firstHostTime
     }
 
     private func appendSilence(frames missingFrames: AVAudioFramePosition,

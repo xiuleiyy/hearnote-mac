@@ -49,6 +49,7 @@ struct SystemAudioRecording {
 @MainActor
 final class SystemAudioCapture {
     var onBuffer: ((AVAudioPCMBuffer, TimeInterval) -> Void)?
+    var onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, TimeInterval) -> Void)?
     var onLevel: ((Double) -> Void)?
     var onError: ((Error) -> Void)?
 
@@ -117,6 +118,7 @@ final class SystemAudioCapture {
         let writer = SystemAudioSink(
             url: url,
             onBuffer: bufferCallback,
+            onCapturedBuffer: onCapturedBuffer,
             onLevel: levelCallback,
             onError: errorCallback
         )
@@ -194,6 +196,7 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
 
     private let url: URL
     private let onBuffer: ((AVAudioPCMBuffer, TimeInterval) -> Void)?
+    private let onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, TimeInterval) -> Void)?
     private let onLevel: ((Double) -> Void)?
     private let onError: ((Error) -> Void)?
     private var file: AVAudioFile?
@@ -203,17 +206,20 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
     private var failure: Error?
     private var finished = false
     private var cleanupWarning: String?
+    private var deliveryTail: Task<Void, Never>?
     private let lifecycleLock = NSLock()
     private var lifecycle = AudioCaptureLifecycle()
 
     init(
         url: URL,
         onBuffer: ((AVAudioPCMBuffer, TimeInterval) -> Void)?,
+        onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, TimeInterval) -> Void)?,
         onLevel: ((Double) -> Void)?,
         onError: ((Error) -> Void)?
     ) {
         self.url = url
         self.onBuffer = onBuffer
+        self.onCapturedBuffer = onCapturedBuffer
         self.onLevel = onLevel
         self.onError = onError
         super.init()
@@ -284,10 +290,13 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
             }
             try file.write(from: pcm)
             writtenFrames += Int64(pcm.frameLength)
+            onCapturedBuffer?(pcm, hostTime)
             let energy = Self.level(of: pcm)
             let bufferCallback = onBuffer
             let levelCallback = onLevel
-            Task { @MainActor in
+            let previous = deliveryTail
+            deliveryTail = Task { @MainActor in
+                if let previous { await previous.value }
                 bufferCallback?(pcm, hostTime)
                 levelCallback?(energy)
             }
@@ -358,8 +367,7 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
                 lifecycleLock.lock()
                 lifecycle.finish()
                 lifecycleLock.unlock()
-                continuation.resume(
-                    returning: SystemAudioRecording(
+                let recording = SystemAudioRecording(
                         url: url,
                         firstHostTime: firstHostTime,
                         frameCount: writtenFrames,
@@ -367,7 +375,11 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
                         failure: failure,
                         cleanupWarning: cleanupWarning
                     )
-                )
+                let deliveries = deliveryTail
+                Task {
+                    if let deliveries { await deliveries.value }
+                    continuation.resume(returning: recording)
+                }
             }
         }
     }
@@ -376,7 +388,11 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
         guard failure == nil, !finished else { return }
         failure = error
         let callback = onError
-        Task { @MainActor in callback?(error) }
+        let previous = deliveryTail
+        deliveryTail = Task { @MainActor in
+            if let previous { await previous.value }
+            callback?(error)
+        }
     }
 
     private func copyPCM(_ sampleBuffer: CMSampleBuffer) throws -> AVAudioPCMBuffer {

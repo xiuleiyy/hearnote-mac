@@ -49,6 +49,11 @@ trap 'exit 143' TERM
 mkdir -p "$hearnote_stage_app/Contents/MacOS" "$hearnote_stage_app/Contents/Resources"
 cp "$binary_dir/HearNote" "$hearnote_stage_app/Contents/MacOS/HearNote"
 cp "$project_root/Resources/Info.plist" "$hearnote_stage_app/Contents/Info.plist"
+mkdir -p "$hearnote_stage_app/Contents/Resources/ThirdPartyLicenses"
+cp "$project_root/Sources/CSpeexDSP/COPYING" \
+    "$hearnote_stage_app/Contents/Resources/ThirdPartyLicenses/SpeexDSP.txt"
+cp "$project_root/Resources/ThirdPartyLicenses/KISS-FFT.txt" \
+    "$hearnote_stage_app/Contents/Resources/ThirdPartyLicenses/KISS-FFT.txt"
 # 在签名前生成并放入资源目录，使 Finder、Dock 和打包后的 App 使用同一图标。
 iconutil -c icns "$project_root/Resources/HearNote.iconset" \
     -o "$hearnote_stage_app/Contents/Resources/HearNote.icns"
