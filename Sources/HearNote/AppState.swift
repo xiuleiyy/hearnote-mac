@@ -150,7 +150,15 @@ final class AppState: ObservableObject {
     @Published var preferences = AppPreferences()
     @Published var showSettings = false
     @Published var showRecording = false
-    @Published var workspaceTab = WorkspaceTab.notes
+    @Published var workspaceTab = WorkspaceTab.notes {
+        didSet {
+            // Navigation releases the independent translator's resources.
+            // Window visibility must not cancel background work.
+            if oldValue == .translation, workspaceTab != .translation {
+                translationWorkspace.close()
+            }
+        }
+    }
     @Published var detailTab = DetailTab.transcript
     @Published var errorMessage: String?
     @Published var busyMessage: String?

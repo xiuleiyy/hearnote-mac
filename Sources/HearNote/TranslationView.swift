@@ -64,7 +64,6 @@ struct TranslationView: View {
             .frame(maxWidth: .infinity, alignment: .top)
         }
         .background(Palette.paper)
-        .onDisappear { workspace.close() }
         .onChange(of: workspace.mode) { _, _ in workspace.close() }
         .onChange(of: firstConversationLanguage) { old, current in
             if current == secondConversationLanguage { secondConversationLanguage = old }
