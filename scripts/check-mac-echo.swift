@@ -8,15 +8,23 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
     guard condition() else { throw HarnessFailure.assertion(message) }
 }
 
+private func diagnostic(_ message: String) {
+    // Write immediately so a following assertion/crash cannot hide CI evidence
+    // in a buffered stdout stream. Only synthetic counts and timing go here.
+    FileHandle.standardError.write(Data("[Mac echo check] \(message)\n".utf8))
+}
+
 @MainActor
 private final class Collector {
     var samples: [Float] = []
     var starts: [Double] = []
     var statuses: [String] = []
+    var deliveries: [(samples: Int, at: Double)] = []
     func append(_ buffer: AVAudioPCMBuffer, at hostTime: Double) {
         starts.append(hostTime)
         if let data = buffer.floatChannelData?[0] {
             samples.append(contentsOf: UnsafeBufferPointer(start: data, count: Int(buffer.frameLength)))
+            deliveries.append((samples.count, ProcessInfo.processInfo.systemUptime))
         }
     }
 }
@@ -82,9 +90,12 @@ struct MacEchoHarness {
         try require(result.failure == nil, "\(name): \(result.failure ?? "")")
         guard let url = result.url else { throw HarnessFailure.assertion("\(name): missing CAF") }
         let file = try AVAudioFile(forReading: url)
-        try require(file.length == result.frameCount, "\(name): CAF/count disagreement")
-        try require(abs(Int(file.length) - expected) <= 8, "\(name): resampling lost duration")
-        try require(collector.samples.count == Int(result.frameCount), "\(name): finish returned before live delivery")
+        try require(file.length == result.frameCount,
+                    "\(name): CAF/count disagreement; actual=\(file.length), written=\(result.frameCount)")
+        try require(abs(Int(file.length) - expected) <= 8,
+                    "\(name): resampling lost duration; actual=\(file.length), expected=\(expected)±8")
+        try require(collector.samples.count == Int(result.frameCount),
+                    "\(name): finish returned before live delivery; actual=\(collector.samples.count), written=\(result.frameCount)")
         try require(file.processingFormat.sampleRate == 16_000, "\(name): target rate")
         try require(file.processingFormat.channelCount == 1, "\(name): target channels")
         for pair in zip(collector.starts, collector.starts.dropFirst()) {
@@ -176,16 +187,41 @@ struct MacEchoHarness {
         let collector = Collector()
         let epoch = hostNow() - 0.25
         let processor = try processor(name: "whole-packet-deadline", root: root, epoch: epoch, collector: collector)
-        let pcm = try buffer(rate: 16_000, start: 0, count: 8_000) { _ in 0.12 }
+        let expected = 8_000
+        let frameSize = MeetingEchoProcessor.frameSize
+        let pcm = try buffer(rate: 16_000, start: 0, count: expected) { _ in 0.12 }
+        let arrivedAt = ProcessInfo.processInfo.systemUptime
         processor.appendMicrophone(pcm, hostTime: epoch)
         try await Task.sleep(nanoseconds: 80_000_000)
-        try require(collector.samples.isEmpty, "whole-packet-deadline: old capture timestamp skipped waiting")
-        // All 25 frames have the same deadline, rather than taking 25 * 180ms.
-        try await Task.sleep(nanoseconds: 240_000_000)
-        try require(collector.samples.count == 8_000, "whole-packet-deadline: frame-by-frame wait accumulated")
+        let earlySamples = collector.samples.count
+        let earlyMilliseconds = Int((ProcessInfo.processInfo.systemUptime - arrivedAt) * 1_000)
+        diagnostic("whole-packet-deadline earlySamples=\(earlySamples) elapsedMs=\(earlyMilliseconds)")
+        try require(earlySamples == 0,
+                    "whole-packet-deadline: old capture timestamp skipped waiting; actual=\(earlySamples), elapsedMs=\(earlyMilliseconds)")
+        // Live delivery emits complete 320-sample frames. AVAudioConverter can
+        // retain tail samples until EOS, leaving one incomplete processing
+        // frame. Require the other 24 frames promptly, then verify all 25 at
+        // finish. A fresh 180ms wait per frame cannot pass this 500ms bound.
+        let requiredLive = expected - frameSize
+        while collector.samples.count < requiredLive,
+              ProcessInfo.processInfo.systemUptime - arrivedAt < 0.5 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let liveSamples = collector.samples.count
+        let elapsedMilliseconds = Int((ProcessInfo.processInfo.systemUptime - arrivedAt) * 1_000)
+        let bulkArrival = collector.deliveries.first { $0.samples >= requiredLive }?.at
+        let bulkMilliseconds = bulkArrival.map { Int(($0 - arrivedAt) * 1_000) }
+        diagnostic("whole-packet-deadline beforeFinishSamples=\(liveSamples) requiredLive=\(requiredLive) expectedTotal=\(expected) elapsedMs=\(elapsedMilliseconds) bulkDeliveryMs=\(bulkMilliseconds.map(String.init) ?? "unavailable")")
         let result = await processor.finish()
-        try verifyFile(result, collector: collector, expected: 8_000, name: "whole-packet-deadline")
-        try require(result.diagnostics.passthroughSamples == 8_000, "whole-packet-deadline: fail-open count")
+        let finishMilliseconds = Int((ProcessInfo.processInfo.systemUptime - arrivedAt) * 1_000)
+        diagnostic("whole-packet-deadline finishedSamples=\(collector.samples.count) writtenSamples=\(result.frameCount) deliveredByFinish=\(collector.samples.count - liveSamples) passthroughSamples=\(result.diagnostics.passthroughSamples) elapsedMs=\(finishMilliseconds)")
+        try require(liveSamples >= requiredLive && liveSamples <= expected && liveSamples % frameSize == 0,
+                    "whole-packet-deadline: frame-by-frame wait accumulated; actual=\(liveSamples), required=\(requiredLive)...\(expected), elapsedMs=\(elapsedMilliseconds)")
+        try require(bulkArrival.map { $0 - arrivedAt <= 0.5 } == true,
+                    "whole-packet-deadline: bulk delivery missed bounded deadline; bulkDeliveryMs=\(bulkMilliseconds.map(String.init) ?? "unavailable")")
+        try verifyFile(result, collector: collector, expected: expected, name: "whole-packet-deadline")
+        try require(result.diagnostics.passthroughSamples == result.frameCount,
+                    "whole-packet-deadline: fail-open count; actual=\(result.diagnostics.passthroughSamples), written=\(result.frameCount)")
         try require(collector.samples.allSatisfy { abs($0 - 0.12) < 0.0001 },
                     "whole-packet-deadline: local voice was muted")
     }

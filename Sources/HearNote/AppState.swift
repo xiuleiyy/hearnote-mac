@@ -194,6 +194,7 @@ final class AppState: ObservableObject {
     private var translationDocumentID: UUID?
     private var meetingRecognitionTask: Task<Void, Never>?
     private var meetingRecognitionID: UUID?
+    private var meetingActivity: BackgroundActivity?
     private var recognitionWarnings: [String: String] = [:]
     private var translationQueue = LiveTranslationQueue()
     private var isTranslatingLive = false
@@ -479,11 +480,13 @@ final class AppState: ObservableObject {
         let vocabulary = preferences.contextualStrings
         transcriber.contextualStrings = preferences.contextualStrings
         busyMessage = "正在转写，原文件保留在本机…"
-        workTask = Task {
+        let activity = BackgroundActivity(reason: "Audio file transcription")
+        workTask = Task { [self, activity] in
             defer {
                 transcriber.onStatusChange = nil
                 workTask = nil
                 busyMessage = nil
+                withExtendedLifetime(activity) {}
             }
             do {
                 let segments: [TranscriptSegment]
@@ -535,8 +538,13 @@ final class AppState: ObservableObject {
             let language = preferences.targetLanguage
             detailTab = tab
             busyMessage = tab == .translation ? "正在翻译…" : "正在生成摘要与待办…"
-            workTask = Task {
-                defer { workTask = nil; busyMessage = nil }
+            let activity = BackgroundActivity(reason: "Document translation or summary")
+            workTask = Task { [self, activity] in
+                defer {
+                    workTask = nil
+                    busyMessage = nil
+                    withExtendedLifetime(activity) {}
+                }
                 do {
                     let start = Date()
                     let result = try await (tab == .translation
@@ -571,6 +579,9 @@ final class AppState: ObservableObject {
             errorMessage = "请先结束翻译页的语音输入，再开始会议录音。"
             return
         }
+        let activity = BackgroundActivity(reason: "Meeting recording and live transcription")
+        meetingActivity = activity
+        defer { withExtendedLifetime(activity) {} }
         isStartingRecording = true
         defer { isStartingRecording = false }
         player.stop()
@@ -631,7 +642,8 @@ final class AppState: ObservableObject {
             else { liveTranslationStatus = "实时翻译已关闭 · 录音继续保存" }
             isPreparingMeetingRecognition = true
             liveRecognitionStatus = "录音已开始，正在准备识别；准备期间的音频可在会后重新转写。"
-            meetingRecognitionTask = Task { [weak self] in
+            meetingRecognitionTask = Task { [weak self, activity] in
+                defer { withExtendedLifetime(activity) {} }
                 await self?.prepareMeetingRecognition(id: id, source: source, settings: settings)
             }
         } catch {
@@ -641,6 +653,7 @@ final class AppState: ObservableObject {
             microphoneSpeech.cancel(); systemSpeech.cancel()
             microphoneMixedSpeech.cancel(); systemMixedSpeech.cancel()
             await recorder.cancel()
+            meetingActivity = nil
             if documents.first(where: { $0.id == id })?.segments.isEmpty == true {
                 documents.removeAll { $0.id == id }
                 selection = documents.first?.id
@@ -856,12 +869,14 @@ final class AppState: ObservableObject {
         let runID = UUID()
         liveTranslationRunID = runID
         isTranslatingLive = false
-        liveTranslationTask = Task {
+        let activity = BackgroundActivity(reason: "Live meeting translation")
+        liveTranslationTask = Task { [self, activity] in
             defer {
                 if liveTranslationRunID == runID {
                     liveTranslationTask = nil
                     liveTranslationRunID = nil
                 }
+                withExtendedLifetime(activity) {}
             }
             while !Task.isCancelled && translateLive && liveTranslationRunID == runID &&
                 translationDocumentID == documentID && (recorder.isRecording || translationQueue.hasPending) {
@@ -951,7 +966,12 @@ final class AppState: ObservableObject {
     func stopMeeting() async {
         guard recorder.isRecording, !isStoppingRecording else { return }
         isStoppingRecording = true
-        defer { isStoppingRecording = false }
+        let activity = meetingActivity
+        defer {
+            meetingActivity = nil
+            isStoppingRecording = false
+            withExtendedLifetime(activity) {}
+        }
         // 先隔离后台准备，不能等下载完成才允许结束，也不能晚到启动下一场会议的识别。
         meetingRecognitionID = nil
         meetingRecognitionTask?.cancel(); meetingRecognitionTask = nil
@@ -1070,6 +1090,7 @@ final class AppState: ObservableObject {
         }
         if recorder.isRecording { await stopMeeting() }
         prepareToQuit()
+        meetingActivity = nil
     }
     static func clock(_ time: Double) -> String {
         let seconds = max(0, Int(time.isFinite ? time : 0))

@@ -68,6 +68,7 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
     private var translationID: UUID?
     private var voiceTask: Task<Void, Never>?
     private var voiceID: UUID?
+    private var voiceActivity: BackgroundActivity?
     private var whisperRecognizer: WhisperLiveRecognizer?
     private var appleRecognizer: LiveSpeechRecognizer?
     private var voiceBackendDescription = ""
@@ -149,7 +150,9 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
             translationID = id
             isTranslating = true
             status = "正在翻译…"
-            translationTask = Task { [weak self] in
+            let activity = BackgroundActivity(reason: "Text translation")
+            translationTask = Task { [weak self, activity] in
+                defer { withExtendedLifetime(activity) {} }
                 let started = Date()
                 do {
                     let output = try await client.translateText(
@@ -312,6 +315,8 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
         let id = UUID()
         voiceID = id
         isPreparing = true
+        let activity = BackgroundActivity(reason: "Voice translation input and recognition")
+        voiceActivity = activity
         let modelVariant = state.preferences.whisperModel
         let terms = state.preferences.contextualStrings
         let speechLocale = Self.localeForLanguage(source)
@@ -354,7 +359,8 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
             }
             self.updateFields { self.inputText = self.recognizedText }
         }
-        voiceTask = Task { [weak self, weak state] in
+        voiceTask = Task { [weak self, weak state, activity] in
+            defer { withExtendedLifetime(activity) {} }
             do {
                 try await Self.authorizeMicrophone()
                 try Task.checkCancellation()
@@ -409,7 +415,9 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
         isFinishingVoice = true
         stopMicrophone()
         status = "\(voiceBackendDescription) · 正在识别最后一句…"
-        voiceTask = Task { [weak self] in
+        let activity = voiceActivity
+        voiceTask = Task { [weak self, activity] in
+            defer { withExtendedLifetime(activity) {} }
             // tap 的 PCM 副本在主队列投递；停止引擎后用队列屏障先收完已排队的最后一批。
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 DispatchQueue.main.async { continuation.resume() }
@@ -427,6 +435,7 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
             self.whisperRecognizer = nil
             self.appleRecognizer = nil
             self.voiceTask = nil
+            self.voiceActivity = nil
             self.isFinishingVoice = false
             self.isPreparing = false
             guard !failed else {
@@ -459,6 +468,7 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
         isListening = false
         isPreparing = false
         isFinishingVoice = false
+        voiceActivity = nil
         if wasActive { status = "语音输入已取消，已识别文字保留" }
     }
 
@@ -483,11 +493,13 @@ final class TranslationWorkspace: NSObject, ObservableObject, AVSpeechSynthesize
             url: url, customWords: state?.preferences.contextualStrings ?? []
         )
         imageOperation = operation
+        let activity = BackgroundActivity(reason: "Translation image text recognition")
         let worker = Task.detached(priority: .userInitiated) {
             try operation.recognize()
         }
         imageWorker = worker
-        imageTask = Task { [weak self] in
+        imageTask = Task { [weak self, activity] in
+            defer { withExtendedLifetime(activity) {} }
             do {
                 let text = try await withTaskCancellationHandler {
                     try await worker.value
