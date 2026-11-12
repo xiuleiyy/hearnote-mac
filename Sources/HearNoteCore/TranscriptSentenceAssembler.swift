@@ -56,7 +56,7 @@ public struct TranscriptSentenceAssembler {
             pendingWords, previousWords: previousWords, observedThrough: observedThrough,
             stableThrough: stableThrough, followingWord: followingWord,
             trailingSilenceFrom: trailingSilenceFrom, finishing: finishing
-        )
+        ).filter { containsContent($0.words.map(\.text).joined()) }
         var usedIDs = Set<UUID>()
         var result: [Update] = []
         var nextPending: [PendingSentence] = []
@@ -120,6 +120,7 @@ public struct TranscriptSentenceAssembler {
         var characterCount = 0
         for (index, word) in words.enumerated() {
             if let previous = current.last, word.start - previous.end >= pauseInterval,
+               !isDependentBoundary(current, next: word.text),
                isStable(current, previousWords: previousWords, through: stableThrough) {
                 result.append(Group(words: current, isFinal: true))
                 current = []
@@ -131,11 +132,23 @@ public struct TranscriptSentenceAssembler {
             let hasFollowingAudio = next != nil || observedThrough - word.end >= 0.35
             let bounded = word.end - (current.first?.start ?? word.start) >= maximumDuration
                 || characterCount >= maximumCharacters
-            if hasFollowingAudio && (isSentenceEnding(word.text, next: next?.text) || bounded)
+            if hasFollowingAudio
                 && isStable(current, previousWords: previousWords, through: stableThrough) {
-                result.append(Group(words: current, isFinal: true))
-                current = []
-                characterCount = 0
+                let sentenceEnd = isSentenceEnding(word.text, next: next?.text)
+                let continuedTooLong = word.end - (current.first?.start ?? word.start)
+                    >= maximumDuration + continuationDuration
+                    || characterCount >= maximumCharacters + continuationCharacters
+                // 十秒/字数是软目标，不把“不是 / 3000元”或谓语/宾语当成句界。
+                // 优先自然句末，其次回溯到分句边界；仍没有时才有界截断并保留尾部。
+                let cut = sentenceEnd ? current.count : bounded
+                    ? clauseBoundary(current, following: next?.text)
+                        ?? (continuedTooLong ? boundedBoundary(current) : nil)
+                    : nil
+                if let cut {
+                    result.append(Group(words: Array(current.prefix(cut)), isFinal: true))
+                    current = Array(current.dropFirst(cut))
+                    characterCount = current.reduce(0) { $0 + $1.text.count }
+                }
             }
         }
         if let last = current.last {
@@ -146,6 +159,7 @@ public struct TranscriptSentenceAssembler {
             } ?? false
             let followingPause = followingWord.map {
                 $0.start - last.end >= pauseInterval
+                    && !isDependentBoundary(current, next: $0.text)
                     && isStable(current, previousWords: previousWords, through: stableThrough)
             } ?? false
             result.append(Group(
@@ -154,6 +168,123 @@ public struct TranscriptSentenceAssembler {
             ))
         }
         return result
+    }
+
+    private var continuationDuration: Double { min(6, max(4, maximumDuration * 0.6)) }
+    private var continuationCharacters: Int { min(96, max(32, maximumCharacters / 3)) }
+
+    /// 只在软目标之后选逗号/分号或明确新分句起点；不根据词数猜完整句。
+    private func clauseBoundary(_ words: [TimedWord], following: String?) -> Int? {
+        guard let first = words.first else { return nil }
+        let minimumDuration = min(4, maximumDuration / 2)
+        for count in (1...words.count).reversed() {
+            let left = Array(words.prefix(count))
+            let next = count < words.count ? words[count].text : following
+            guard let next, words[count - 1].end - first.start >= minimumDuration,
+                  containsContent(left.map(\.text).joined()),
+                  !isDependentBoundary(left, next: next) else { continue }
+            let ending = words[count - 1].text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if ending.last.map({ "，,；;：:".contains($0) }) == true
+                || startsClause(next) {
+                return count
+            }
+        }
+        return nil
+    }
+
+    /// 无句界的连续讲话最多多等有限时间；留下至少一个词供下一快照续写。
+    /// 回溯避开可识别的依存连接，限制是词级兜底，不是完整语法分析。
+    private func boundedBoundary(_ words: [TimedWord]) -> Int? {
+        guard words.count > 1 else { return nil } // 不把一个 tokenizer 词的文字截成两半。
+        for count in (1..<words.count).reversed() {
+            let left = Array(words.prefix(count))
+            if containsContent(left.map(\.text).joined()),
+               !isDependentBoundary(left, next: words[count].text) {
+                return count
+            }
+        }
+        // 全段均是依存词时只保留有限尾部；不能让异常模型输出无限积压。
+        return words.count > 8 ? words.count - 8 : nil
+    }
+
+    private func startsClause(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = trimmed.split(whereSeparator: \.isWhitespace).first.map(String.init)?.lowercased() ?? ""
+        let english: Set<String> = ["while", "whereas", "although", "however", "therefore", "meanwhile"]
+        if english.contains(token) { return true }
+        return ["但是", "不过", "然而", "同时", "随后", "另外", "而且", "并且"].contains {
+            trimmed.hasPrefix($0)
+        }
+    }
+
+    private func isDependentBoundary(_ words: [TimedWord], next: String) -> Bool {
+        guard let last = words.last else { return true }
+        let left = words.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+        let right = next.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !right.isEmpty else { return true }
+        if isSentenceEnding(last.text, next: next) { return false }
+        let punctuation = CharacterSet.punctuationCharacters
+        let leftToken = left.split(whereSeparator: \.isWhitespace).last.map(String.init)?
+            .trimmingCharacters(in: punctuation).lowercased() ?? ""
+        let rightToken = right.split(whereSeparator: \.isWhitespace).first.map(String.init)?
+            .trimmingCharacters(in: punctuation).lowercased() ?? ""
+        let dependentLeft: Set<String> = [
+            "not", "no", "never", "cannot", "can't", "don't", "doesn't", "didn't", "won't",
+            "isn't", "aren't", "wasn't", "weren't", "must", "should", "could", "would", "will",
+            "can", "may", "might", "to", "of", "for", "with", "at", "on", "in", "into", "from",
+            "the", "a", "an", "and", "or", "but", "while", "although", "because", "that",
+            "write", "writes", "writing", "written", "finish", "finishes", "finishing",
+            "keep", "keeps", "keeping", "need", "needs", "require", "requires",
+            "set", "save", "saves", "saving", "store", "stores", "test", "tests",
+            "is", "are", "was", "were", "be", "been", "being", "has", "have", "had"
+        ]
+        let dependentRight: Set<String> = [
+            "not", "never", "cannot", "can't", "don't", "doesn't", "didn't", "rather", "instead",
+            "the", "a", "an", "to", "of", "for", "with", "at", "on", "in", "into", "from"
+        ]
+        if dependentLeft.contains(leftToken) || dependentRight.contains(rightToken) { return true }
+        // 中文 tokenizer 可把“不是”“不能写进”拆成单字，检查原词连接后的尾部。
+        if ["不", "没", "未", "无", "不是", "不能", "不可", "不会", "不要", "没有", "尚未",
+            "无需", "不得", "并非", "写", "存", "保存", "保持", "决定", "完成", "测试", "等于",
+            "是", "为", "把", "将", "让", "用", "对", "从", "在", "与", "和", "或", "的"]
+            .contains(where: { left.hasSuffix($0) }) { return true }
+        if ["不是", "而不是", "不能", "不要", "不可", "不得", "进", "到", "给", "的", "了", "着", "过"]
+            .contains(where: { right.hasPrefix($0) }) { return true }
+        let numberWords: Set<String> = [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+            "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+            "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+            "eighty", "ninety", "hundred", "thousand", "million", "billion", "point"
+        ]
+        // 逗号、单位可能是独立 token；检查最近的有内容词，不能把“3 / , / 000”切开。
+        let lastContent = words.reversed().first { containsContent($0.text) }?.text ?? last.text
+        let numericLeft = lastContent.contains(where: \.isNumber) || numberWords.contains(leftToken)
+        let units: Set<String> = [
+            "millisecond", "milliseconds", "second", "seconds", "minute", "minutes",
+            "hour", "hours", "yuan", "dollar", "dollars", "percent", "ms", "kb", "mb", "gb",
+            "hundred", "thousand", "million", "billion"
+        ]
+        if numericLeft && (right.first?.isNumber == true || units.contains(rightToken)
+            || numberWords.contains(rightToken) || rightToken == "and"
+            || ["元", "块", "万", "亿", "点", "分", "秒", "毫秒", "个", "条", "次", "%", "％"]
+                .contains(where: { right.hasPrefix($0) })) { return true }
+        // 小数和千分位分隔符不能被当成分句标点。
+        if numericLeft, let first = right.first, ",.，".contains(first),
+           right.dropFirst().first?.isNumber == true { return true }
+        if let lastCharacter = left.last,
+           ",.:，".contains(lastCharacter), right.first?.isNumber == true,
+           String(left.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines).last?.isNumber == true {
+            return true
+        }
+        return false
+    }
+
+    /// 仅过滤新模型快照的独立纯标点组；不清洗原词或已有人工笔记。
+    private func containsContent(_ text: String) -> Bool {
+        text.unicodeScalars.contains {
+            !CharacterSet.whitespacesAndNewlines.contains($0)
+                && !CharacterSet.punctuationCharacters.contains($0)
+        }
     }
 
     private func isStable(_ words: [TimedWord], previousWords: [TimedWord], through: Double) -> Bool {

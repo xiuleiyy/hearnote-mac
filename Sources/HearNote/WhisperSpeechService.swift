@@ -295,7 +295,6 @@ final class WhisperSpeechService: ObservableObject {
                     modelVariant: String = WhisperSpeechService.defaultModelVariant,
                     locale: String = "zh-en") async throws
         -> [TranscriptSegment] {
-        let language = Self.decodingLanguage(for: locale)
         let restrictToChineseEnglish = Self.isChineseEnglishLocale(locale)
         guard fileTask == nil else { throw WhisperSpeechError.decoderBusy }
         try await prepare(modelVariant: modelVariant)
@@ -315,6 +314,8 @@ final class WhisperSpeechService: ObservableObject {
             guard duration.isFinite, duration > 0 else { throw MediaServiceError.invalidDuration }
             var start: Double = 0
             var sentences = TranscriptSentenceAssembler()
+            var reconciliation = WhisperWindowReconciliationPolicy()
+            var languageSelection = WhisperLanguageSelectionPolicy(locale: locale)
             while start < duration {
                 try self.checkFileRun(id)
                 let end = min(duration, start + 24)
@@ -322,28 +323,35 @@ final class WhisperSpeechService: ObservableObject {
                 let audioEnd = min(duration, end + 3)
                 let samples = try Self.readAudio(asset: asset, track: track,
                                                 start: audioStart, end: audioEnd)
-                let results = try await self.decode(samples: samples,
-                                                    contextualStrings: contextualStrings,
-                                                    language: language,
-                                                    restrictToChineseEnglish: restrictToChineseEnglish)
+                var results = try await self.decode(
+                    samples: samples, contextualStrings: contextualStrings,
+                    language: languageSelection.language(coreStart: start, audioEnd: audioEnd),
+                    restrictToChineseEnglish: restrictToChineseEnglish
+                )
                 try self.checkFileRun(id)
-                let decodedWords = Self.words(from: results)
-                let pieces = decodedWords
-                    .filter { word in
-                        let midpoint = audioStart + (word.start + word.end) / 2
-                        return midpoint >= start && midpoint < end
-                    }
-                let absoluteWords = pieces.map {
-                    TimedWord(start: audioStart + $0.start, end: audioStart + $0.end, text: $0.text)
+                languageSelection.observe(language: results.first?.language, coreStart: start,
+                                          audioEnd: audioEnd)
+                var snapshot = reconciliation.reconcile(
+                    words: Self.absoluteWords(from: results, offset: audioStart),
+                    coreStart: start, publicationEnd: end, audioEnd: audioEnd
+                )
+                if snapshot.requiresConfirmation {
+                    // 每个文件窗口最多一次额外确认，不因明显回退无限重跑。
+                    results = try await self.decode(
+                        samples: samples, contextualStrings: contextualStrings,
+                        language: languageSelection.language(coreStart: start, audioEnd: audioEnd),
+                        restrictToChineseEnglish: restrictToChineseEnglish
+                    )
+                    try self.checkFileRun(id)
+                    snapshot = reconciliation.reconcile(
+                        words: Self.absoluteWords(from: results, offset: audioStart),
+                        coreStart: start, publicationEnd: end, audioEnd: audioEnd, confirmed: true
+                    )
                 }
                 let updates = sentences.update(
-                    words: absoluteWords, replacingFrom: start, observedThrough: audioEnd,
+                    words: snapshot.words, replacingFrom: start, observedThrough: audioEnd,
                     stableThrough: end,
-                    followingWord: decodedWords.first(where: {
-                        audioStart + ($0.start + $0.end) / 2 >= end
-                    }).map {
-                        TimedWord(start: audioStart + $0.start, end: audioStart + $0.end, text: $0.text)
-                    },
+                    followingWord: snapshot.followingWord,
                     finishing: end >= duration
                 )
                 for update in updates {
@@ -390,14 +398,6 @@ final class WhisperSpeechService: ObservableObject {
         guard fileRunID == id else { throw CancellationError() }
     }
 
-    fileprivate static func decodingLanguage(for locale: String) -> String? {
-        let normalized = locale.lowercased().replacingOccurrences(of: "_", with: "-")
-        guard normalized != "zh-en",
-              let language = normalized.split(separator: "-").first.map(String.init),
-              ["zh", "en", "ja", "ko", "fr", "de", "es"].contains(language) else { return nil }
-        return language
-    }
-
     fileprivate static func isChineseEnglishLocale(_ locale: String) -> Bool {
         locale.lowercased().replacingOccurrences(of: "_", with: "-") == "zh-en"
     }
@@ -428,7 +428,7 @@ final class WhisperSpeechService: ObservableObject {
                 scoped.logitsFilters = standard.logitsFilters
                 scoped.tokenizer = try ChineseEnglishTokenizer(base: tokenizer)
                 // decodeTail 串行保护 SDK；无论成功、失败还是取消都会恢复默认解码器。
-                kit.textDecoder = scoped
+                kit.textDecoder = StableChineseEnglishDecoder(base: scoped)
             }
             var options = DecodingOptions(
                 verbose: false, task: .transcribe, language: language,
@@ -465,6 +465,13 @@ final class WhisperSpeechService: ObservableObject {
     }
 
     fileprivate typealias TimedWord = WhisperTranscriptCleaner.TimedWord
+
+    fileprivate static func absoluteWords(from results: [TranscriptionResult], offset: Double)
+        -> [TimedWord] {
+        words(from: results).map {
+            TimedWord(start: offset + $0.start, end: offset + $0.end, text: $0.text)
+        }
+    }
 
     fileprivate static func words(from results: [TranscriptionResult]) -> [TimedWord] {
         let words = results.flatMap(\.segments).flatMap { segment -> [TimedWord] in
@@ -566,6 +573,75 @@ private struct ChineseEnglishTokenizer: WhisperTokenizer {
     }
 }
 
+/// SDK 1.1.1 在 temperature fallback 内再次检测语言。复用同一 encoder 的
+/// 首次结果，让升温只修订文字、不重采语种；新 encoder 仍允许真实语言切换。
+/// 委派既有 TextDecoder，不额外运行 audioEncoder、不修改已加载模型或 tokenizer 文本。
+private final class StableChineseEnglishDecoder: TextDecoding {
+    private let base: TextDecoder
+    private var cachedEncoder: MLMultiArray?
+    private var cachedLanguage: DecodingResult?
+
+    init(base: TextDecoder) { self.base = base }
+
+    var tokenizer: (any WhisperTokenizer)? {
+        get { base.tokenizer }
+        set { base.tokenizer = newValue }
+    }
+    var isModelMultilingual: Bool {
+        get { base.isModelMultilingual }
+        set { base.isModelMultilingual = newValue }
+    }
+    var supportsWordTimestamps: Bool { base.supportsWordTimestamps }
+    var logitsSize: Int? { base.logitsSize }
+    var logitsFilters: [any LogitsFiltering]? {
+        get { base.logitsFilters }
+        set { base.logitsFilters = newValue }
+    }
+    var kvCacheEmbedDim: Int? { base.kvCacheEmbedDim }
+    var kvCacheMaxSequenceLength: Int? { base.kvCacheMaxSequenceLength }
+    var windowSize: Int? { base.windowSize }
+    var embedSize: Int? { base.embedSize }
+
+    func predictLogits(_ inputs: any TextDecoderInputType) async throws -> TextDecoderOutputType? {
+        try await base.predictLogits(inputs)
+    }
+
+    func prepareDecoderInputs(withPrompt initialPrompt: [Int]) throws -> any DecodingInputsType {
+        try base.prepareDecoderInputs(withPrompt: initialPrompt)
+    }
+
+    func prefillDecoderInputs(_ decoderInputs: any DecodingInputsType,
+                              withOptions options: DecodingOptions?) async throws -> any DecodingInputsType {
+        try await base.prefillDecoderInputs(decoderInputs, withOptions: options)
+    }
+
+    func decodeText(from encoderOutput: any AudioEncoderOutputType,
+                    using decoderInputs: any DecodingInputsType, sampler tokenSampler: TokenSampling,
+                    options decoderOptions: DecodingOptions,
+                    callback: TranscriptionCallback?) async throws -> DecodingResult {
+        try await base.decodeText(from: encoderOutput, using: decoderInputs,
+                                  sampler: tokenSampler, options: decoderOptions, callback: callback)
+    }
+
+    func detectLanguage(from encoderOutput: any AudioEncoderOutputType,
+                        using decoderInputs: any DecodingInputsType, sampler tokenSampler: TokenSampling,
+                        options: DecodingOptions, temperature: FloatType) async throws -> DecodingResult {
+        if let encoder = encoderOutput as? MLMultiArray, encoder === cachedEncoder,
+           var cachedLanguage {
+            // 缓存命中没有新推理，不能把第一次检测耗时再计入 fallback。
+            cachedLanguage.timings = nil
+            return cachedLanguage
+        }
+        let result = try await base.detectLanguage(
+            from: encoderOutput, using: decoderInputs, sampler: tokenSampler,
+            options: options, temperature: temperature
+        )
+        cachedEncoder = encoderOutput as? MLMultiArray
+        cachedLanguage = result
+        return result
+    }
+}
+
 /// 已有录音采集供应 PCM，不另外打开麦克风；每个来源独立缓冲，共享一个模型。
 @MainActor
 final class WhisperLiveRecognizer: ObservableObject {
@@ -576,8 +652,8 @@ final class WhisperLiveRecognizer: ObservableObject {
     private var sessionID: UUID?
     private var source = ""
     private var terms: [String] = []
-    private var language: String?
     private var restrictToChineseEnglish = false
+    private var languageSelection = WhisperLanguageSelectionPolicy(locale: "zh-en")
     private var update: ((TranscriptSegment, Bool) -> Void)?
     private var epochs: [AudioEpoch] = []
     private var converter: AVAudioConverter?
@@ -598,8 +674,8 @@ final class WhisperLiveRecognizer: ObservableObject {
         guard !service.loadedModelVariant.isEmpty else { throw WhisperSpeechError.modelUnavailable }
         self.source = source
         terms = contextualStrings
-        language = WhisperSpeechService.decodingLanguage(for: locale)
         restrictToChineseEnglish = WhisperSpeechService.isChineseEnglishLocale(locale)
+        languageSelection = WhisperLanguageSelectionPolicy(locale: locale)
         update = onUpdate
         origin = Date()
         let id = UUID()
@@ -732,7 +808,6 @@ final class WhisperLiveRecognizer: ObservableObject {
             return
         }
         let id = UUID()
-        let language = self.language
         let restrictToChineseEnglish = self.restrictToChineseEnglish
         let terms = self.terms
         processingID = id
@@ -773,18 +848,50 @@ final class WhisperLiveRecognizer: ObservableObject {
                         hasTrailingSilence: trailingSilenceFrom != nil
                     ) != nil else { return }
                     epoch.lastDecodedEnd = audioEnd
-                    let results = try await self.service.decode(samples: snapshot,
-                                                                contextualStrings: terms,
-                                                                language: language,
-                                                                restrictToChineseEnglish: restrictToChineseEnglish)
+                    var results = try await self.service.decode(
+                        samples: snapshot, contextualStrings: terms,
+                        language: self.languageSelection.language(
+                            coreStart: epoch.offset + epoch.coreStart,
+                            audioEnd: epoch.offset + audioEnd
+                        ), restrictToChineseEnglish: restrictToChineseEnglish
+                    )
                     try Task.checkCancellation()
                     guard self.sessionID == session else { return }
-                    self.publish(results, epoch: epoch, audioStart: audioStart,
-                                 audioEnd: audioEnd,
-                                 coreEnd: WhisperDecodeSchedulingPolicy.publicationEnd(
-                                    coreEnd: coreEnd, audioEnd: audioEnd, complete: complete,
-                                    hasTrailingSilence: trailingSilenceFrom != nil
-                                 ), complete: complete,
+                    self.languageSelection.observe(
+                        language: results.first?.language, coreStart: epoch.offset + epoch.coreStart,
+                        audioEnd: epoch.offset + audioEnd
+                    )
+                    let publicationEnd = WhisperDecodeSchedulingPolicy.publicationEnd(
+                        coreEnd: coreEnd, audioEnd: audioEnd, complete: complete,
+                        hasTrailingSilence: trailingSilenceFrom != nil
+                    )
+                    var reconciled = epoch.reconciliation.reconcile(
+                        words: WhisperSpeechService.absoluteWords(
+                            from: results, offset: epoch.offset + audioStart
+                        ), coreStart: epoch.offset + epoch.coreStart,
+                        publicationEnd: epoch.offset + publicationEnd,
+                        audioEnd: epoch.offset + audioEnd
+                    )
+                    if reconciled.requiresConfirmation {
+                        results = try await self.service.decode(
+                            samples: snapshot, contextualStrings: terms,
+                            language: self.languageSelection.language(
+                                coreStart: epoch.offset + epoch.coreStart,
+                                audioEnd: epoch.offset + audioEnd
+                            ), restrictToChineseEnglish: restrictToChineseEnglish
+                        )
+                        try Task.checkCancellation()
+                        guard self.sessionID == session else { return }
+                        reconciled = epoch.reconciliation.reconcile(
+                            words: WhisperSpeechService.absoluteWords(
+                                from: results, offset: epoch.offset + audioStart
+                            ), coreStart: epoch.offset + epoch.coreStart,
+                            publicationEnd: epoch.offset + publicationEnd,
+                            audioEnd: epoch.offset + audioEnd, confirmed: true
+                        )
+                    }
+                    self.publish(reconciled, epoch: epoch, audioEnd: audioEnd,
+                                 coreEnd: publicationEnd, complete: complete,
                                  trailingSilenceFrom: trailingSilenceFrom)
                     if complete {
                         epoch.coreStart = coreEnd
@@ -823,32 +930,14 @@ final class WhisperLiveRecognizer: ObservableObject {
         }
     }
 
-    private func publish(_ results: [TranscriptionResult], epoch: AudioEpoch,
-                         audioStart: Double, audioEnd: Double, coreEnd: Double, complete: Bool,
+    private func publish(_ snapshot: WhisperWindowReconciliationPolicy.Snapshot, epoch: AudioEpoch,
+                         audioEnd: Double, coreEnd: Double, complete: Bool,
                          trailingSilenceFrom: Double?) {
-        let decodedWords = WhisperSpeechService.words(from: results)
-        let words = decodedWords.filter {
-            let midpoint = audioStart + ($0.start + $0.end) / 2
-            return midpoint >= epoch.coreStart && midpoint < coreEnd
-        }
-        let absoluteWords = words.map {
-            WhisperSpeechService.TimedWord(
-                start: epoch.offset + audioStart + $0.start,
-                end: epoch.offset + audioStart + $0.end, text: $0.text
-            )
-        }
         let changes = epoch.sentences.update(
-            words: absoluteWords, replacingFrom: epoch.offset + epoch.coreStart,
+            words: snapshot.words, replacingFrom: epoch.offset + epoch.coreStart,
             observedThrough: epoch.offset + audioEnd,
             stableThrough: epoch.offset + (complete ? coreEnd : epoch.coreStart),
-            followingWord: decodedWords.first(where: {
-                audioStart + ($0.start + $0.end) / 2 >= coreEnd
-            }).map {
-                WhisperSpeechService.TimedWord(
-                    start: epoch.offset + audioStart + $0.start,
-                    end: epoch.offset + audioStart + $0.end, text: $0.text
-                )
-            },
+            followingWord: snapshot.followingWord,
             trailingSilenceFrom: trailingSilenceFrom, source: source,
             finishing: complete && epoch.closed && coreEnd >= epoch.end
         )
@@ -881,6 +970,7 @@ private final class AudioEpoch {
     var closed = false
     var sentences = TranscriptSentenceAssembler()
     var decodeScheduling = WhisperDecodeSchedulingPolicy()
+    var reconciliation = WhisperWindowReconciliationPolicy()
     var end: Double { bufferStart + Double(samples.count) / 16_000 }
     init(offset: Double) { self.offset = offset }
 }

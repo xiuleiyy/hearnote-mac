@@ -110,6 +110,20 @@ struct TranscriptComparisonView: View {
             .lineSpacing(6)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
+            if state.canRetryLiveTranslation(documentID: documentID, segment: segment) {
+                if let message = state.liveTranslationFailureMessage(documentID: documentID, segment: segment) {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                Button("重试此段翻译") {
+                    state.retryLiveTranslation(documentID: documentID, segment: segment)
+                }
+                .buttonStyle(.bordered)
+                .help("使用当前 Region 和模型重试这一段；后续字幕继续接收。")
+            }
             Divider().padding(.top, 8)
         }.padding(.bottom, 18)
     }

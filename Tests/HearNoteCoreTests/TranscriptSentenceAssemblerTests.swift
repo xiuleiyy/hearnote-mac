@@ -71,12 +71,13 @@ final class TranscriptSentenceAssemblerTests: XCTestCase {
 
     func testContinuousSpeechHasBoundedSentenceLengthAtWholeWordBoundary() {
         var assembler = TranscriptSentenceAssembler(maximumDuration: 10)
-        let words = (0..<13).map { word($0 == 0 ? "word" : " word", Double($0), Double($0) + 0.9) }
-        let changes = assembler.update(words: words, replacingFrom: 0, observedThrough: 13,
-                                       stableThrough: 13)
-        XCTAssertEqual(changes.count, 2)
-        XCTAssertTrue(changes[0].isFinal)
-        XCTAssertLessThanOrEqual(changes[0].segment.end, 10.9)
+        let words = (0..<36).map { word($0 == 0 ? "word" : " word", Double($0), Double($0) + 0.9) }
+        let changes = assembler.update(words: words, replacingFrom: 0, observedThrough: 36,
+                                       stableThrough: 36)
+        XCTAssertEqual(changes.count, 3)
+        XCTAssertTrue(changes.dropLast().allSatisfy(\.isFinal))
+        XCTAssertFalse(changes.last!.isFinal)
+        XCTAssertTrue(changes.allSatisfy { $0.segment.end - $0.segment.start <= 16 })
         XCTAssertEqual(changes.map(\.segment.text).joined(separator: " "), words.map(\.text).joined())
     }
 
@@ -174,9 +175,8 @@ final class TranscriptSentenceAssemblerTests: XCTestCase {
                     word(" tail", 1, 1.5), word(" invalid", .nan, 2)],
             replacingFrom: 0, observedThrough: 1.7, stableThrough: 1.7
         )
-        XCTAssertEqual(changes.map(\.segment.text), ["abcdefghij klmnopqrst", "tail"])
-        XCTAssertTrue(changes[0].isFinal)
-        XCTAssertFalse(changes[1].isFinal)
+        XCTAssertEqual(changes.map(\.segment.text), ["abcdefghij klmnopqrst tail"])
+        XCTAssertFalse(changes[0].isFinal)
     }
 
     func testEmptySnapshotsBeforeBoundaryCannotEraseCarriedPrefix() {
@@ -354,5 +354,201 @@ final class TranscriptSentenceAssemblerTests: XCTestCase {
         XCTAssertEqual(finished[0].segment.text, "retry count")
         XCTAssertTrue(finished[0].isFinal)
         XCTAssertTrue(assembler.finish().isEmpty)
+    }
+
+    func testSoftTenSecondTargetKeepsChineseNegationWithAmountUntilSentenceEnds() {
+        var assembler = TranscriptSentenceAssembler()
+        let prefix = [
+            word("今天讨论发布计划", 0, 4), word("，预算", 4, 7),
+            word("是", 7, 8), word("300", 8, 9), word("元", 9, 9.5),
+            word("不是", 9.5, 10.2)
+        ]
+        let draft = assembler.update(words: prefix, replacingFrom: 0,
+                                     observedThrough: 10.5, stableThrough: 11)
+        XCTAssertEqual(draft.count, 1)
+        XCTAssertFalse(draft[0].isFinal)
+        let completed = assembler.update(
+            words: prefix + [word("3000", 10.2, 10.8), word("元。", 10.8, 11.2)],
+            replacingFrom: 0, observedThrough: 11.8, stableThrough: 12, source: "会议声音"
+        )
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertEqual(completed[0].segment.id, draft[0].segment.id)
+        XCTAssertEqual(completed[0].segment.text, "今天讨论发布计划，预算是300元不是3000元。")
+        XCTAssertEqual(completed[0].segment.source, "会议声音")
+        XCTAssertTrue(completed[0].isFinal)
+        XCTAssertTrue(assembler.finish().isEmpty)
+    }
+
+    func testSoftTargetKeepsCannotWriteWithItsExportedFileObject() {
+        var assembler = TranscriptSentenceAssembler()
+        let prefix = [word("Bedrock API key应该保存在钥匙串", 0, 8.5),
+                      word("，不能", 8.5, 9.3), word("写", 9.3, 10.2)]
+        let draft = assembler.update(words: prefix, replacingFrom: 0,
+                                     observedThrough: 10.5, stableThrough: 11)
+        XCTAssertEqual(draft.count, 1)
+        XCTAssertFalse(draft[0].isFinal)
+        let completed = assembler.update(
+            words: prefix + [word("进", 10.2, 10.5), word("导出的文件。", 10.5, 12)],
+            replacingFrom: 0, observedThrough: 12.5, stableThrough: 13
+        )
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertEqual(completed[0].segment.id, draft[0].segment.id)
+        XCTAssertEqual(completed[0].segment.text, "Bedrock API key应该保存在钥匙串，不能写进导出的文件。")
+        XCTAssertTrue(completed[0].isFinal)
+    }
+
+    func testLongEnglishChoosesClauseBeforeWhileAndKeepsFinishesWithTheTest() {
+        var assembler = TranscriptSentenceAssembler()
+        let words = [
+            word("We will keep reviewing the release window", 0, 7.5),
+            word(" while", 7.5, 8), word(" Li", 8, 8.5), word(" Ming", 8.5, 9),
+            word(" finishes", 9, 10.5), word(" the", 10.5, 10.9),
+            word(" test", 10.9, 11.5), word(" tomorrow", 11.5, 12.8),
+            word(" at", 12.8, 13.1), word(" ten", 13.1, 14),
+            word(" and", 14, 14.3), word(" shares", 14.3, 15),
+            word(" results.", 15, 15.99)
+        ]
+        let changes = assembler.update(words: words, replacingFrom: 0,
+                                       observedThrough: 16.5, stableThrough: 17)
+        XCTAssertEqual(changes.map(\.segment.text),
+                       ["We will keep reviewing the release window",
+                        "while Li Ming finishes the test tomorrow at ten and shares results."])
+        XCTAssertTrue(changes.allSatisfy(\.isFinal))
+        XCTAssertEqual(changes[0].segment.end, 7.5)
+        XCTAssertTrue(assembler.finish().isEmpty)
+    }
+
+    func testSoftTargetUsesPreviousSafeCommaAndCarriesOriginalTailAcrossWindow() {
+        var assembler = TranscriptSentenceAssembler()
+        let words = [word("We reviewed the first topic,", 0, 7),
+                     word(" another topic", 7, 11.7)]
+        let first = assembler.update(words: words, replacingFrom: 0,
+                                     observedThrough: 12.2, stableThrough: 12)
+        XCTAssertEqual(first.map(\.segment.text), ["We reviewed the first topic,", "another topic"])
+        guard first.count == 2 else { return }
+        XCTAssertTrue(first[0].isFinal)
+        XCTAssertFalse(first[1].isFinal)
+        let later = assembler.update(
+            words: [word(" needs review.", 12, 13)], replacingFrom: 12,
+            observedThrough: 13.5, stableThrough: 14
+        )
+        XCTAssertEqual(later.count, 1)
+        XCTAssertEqual(later[0].segment.id, first[1].segment.id)
+        XCTAssertEqual(later[0].segment.text, "another topic needs review.")
+        XCTAssertTrue(later[0].isFinal)
+    }
+
+    func testHardFallbackBacktracksBeforeNegationAndKeepsNumberWithUnit() {
+        var assembler = TranscriptSentenceAssembler(maximumDuration: 1)
+        let prefix = (0..<5).map { word($0 == 0 ? "话题" : "继续", Double($0), Double($0) + 0.8) }
+        let words = prefix + [word("不是", 4.8, 5.1), word("3000", 5.1, 5.4), word("元", 5.4, 5.7)]
+        let first = assembler.update(words: words, replacingFrom: 0,
+                                     observedThrough: 6, stableThrough: 7)
+        XCTAssertEqual(first.count, 2)
+        XCTAssertTrue(first[0].isFinal)
+        XCTAssertFalse(first[1].isFinal)
+        XCTAssertTrue(first[1].segment.text.contains("不是3000元"))
+        XCTAssertFalse(first[0].segment.text.contains("不是"))
+        let final = assembler.finish()
+        XCTAssertEqual(final.count, 1)
+        XCTAssertEqual(final[0].segment.id, first[1].segment.id)
+        XCTAssertTrue(final[0].isFinal)
+        XCTAssertTrue(assembler.finish().isEmpty)
+    }
+
+    func testHardFallbackDoesNotSplitNumericMillisecondsOrChineseAmount() {
+        for pair in [[" 300", " milliseconds"], ["300", "元"]] {
+            var assembler = TranscriptSentenceAssembler(maximumDuration: 1)
+            let words = (0..<5).map { word($0 == 0 ? "topic" : " topic", Double($0), Double($0) + 0.8) }
+                + [word(pair[0], 4.8, 5.1), word(pair[1], 5.1, 5.6)]
+            let changes = assembler.update(words: words, replacingFrom: 0,
+                                           observedThrough: 6, stableThrough: 7)
+            XCTAssertEqual(changes.count, 2)
+            XCTAssertTrue(changes[1].segment.text.contains(pair.joined().trimmingCharacters(in: .whitespaces)))
+            XCTAssertFalse(changes[0].segment.text.contains("300"))
+        }
+    }
+
+    func testCharacterFallbackIsBoundedWithoutSplittingFinalDependentTail() {
+        var assembler = TranscriptSentenceAssembler(maximumCharacters: 20)
+        let words = [
+            word("abcdefghij", 0, 0.5), word(" klmnopqrst", 0.5, 1),
+            word(" uvwxyzabcd", 1, 1.5), word(" efghijklmn", 1.5, 2),
+            word(" cannot", 2, 2.3), word(" write", 2.3, 2.6),
+            word(" into", 2.6, 2.9), word(" the", 2.9, 3.2),
+            word(" file", 3.2, 3.5)
+        ]
+        let changes = assembler.update(words: words, replacingFrom: 0,
+                                       observedThrough: 4, stableThrough: 5)
+        XCTAssertEqual(changes.count, 2)
+        XCTAssertTrue(changes[0].isFinal)
+        XCTAssertFalse(changes[1].isFinal)
+        XCTAssertTrue(changes[1].segment.text.contains("cannot write into the file"))
+        XCTAssertEqual(changes.map(\.segment.text).joined(separator: " "), words.map(\.text).joined())
+    }
+
+    func testKnownPauseBetweenPredicateAndObjectDoesNotSealBrokenSentence() {
+        var assembler = TranscriptSentenceAssembler()
+        let changes = assembler.update(
+            words: [word("不能写", 0, 2), word("进导出的文件。", 3, 5)],
+            replacingFrom: 0, observedThrough: 5.5, stableThrough: 6
+        )
+        XCTAssertEqual(changes.count, 1)
+        XCTAssertEqual(changes[0].segment.text, "不能写进导出的文件。")
+        XCTAssertTrue(changes[0].isFinal)
+    }
+
+    func testStandaloneModelPunctuationDoesNotBecomeCaptionOrPendingSentence() {
+        for text in ["。", "…", "！？？", " \n .,;: “”。 "] {
+            var assembler = TranscriptSentenceAssembler()
+            XCTAssertTrue(assembler.update(words: [word(text, 80.223, 80.383)],
+                                           replacingFrom: 80, observedThrough: 82,
+                                           stableThrough: 82).isEmpty)
+            XCTAssertFalse(assembler.hasPendingSentence)
+            XCTAssertTrue(assembler.finish().isEmpty)
+        }
+    }
+
+    func testSeparatePunctuationTokenWithinSentenceRemainsInOriginalText() {
+        var assembler = TranscriptSentenceAssembler()
+        let changes = assembler.update(
+            words: [word("你好", 0, 0.5), word("，", 0.5, 0.6),
+                    word("今天预算是300元", 0.6, 2), word("。", 2, 2.1)],
+            replacingFrom: 0, observedThrough: 3, stableThrough: 3
+        )
+        XCTAssertEqual(changes.count, 1)
+        XCTAssertEqual(changes[0].segment.text, "你好，今天预算是300元。")
+        XCTAssertTrue(changes[0].isFinal)
+    }
+
+    func testPunctuationOnlyReplacementRetractsDraftWithoutCreatingSemanticContent() {
+        var assembler = TranscriptSentenceAssembler()
+        let first = assembler.update(words: [word("temporary hypothesis", 2, 3)],
+                                     replacingFrom: 0, observedThrough: 3.2)
+        let removed = assembler.update(words: [word("。", 2, 3)], replacingFrom: 0,
+                                       observedThrough: 4, stableThrough: 4)
+        XCTAssertEqual(removed.count, 1)
+        XCTAssertEqual(removed[0].segment.id, first[0].segment.id)
+        XCTAssertEqual(removed[0].segment.text, "")
+        XCTAssertFalse(removed[0].isFinal)
+        XCTAssertFalse(assembler.hasPendingSentence)
+    }
+
+    func testSeparateThousandsSeparatorIsNotMistakenForSafeClauseBoundary() {
+        var assembler = TranscriptSentenceAssembler()
+        let prefix = [
+            word("The budget is", 0, 5), word(" 3", 5, 5.2), word(",", 5.2, 5.3),
+            word("000", 5.3, 7), word(" yuan", 7, 10.5)
+        ]
+        let first = assembler.update(words: prefix, replacingFrom: 0,
+                                     observedThrough: 11, stableThrough: 12)
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(first[0].segment.text, "The budget is 3,000 yuan")
+        XCTAssertFalse(first[0].isFinal)
+        let final = assembler.finish()
+        XCTAssertEqual(final.count, 1)
+        XCTAssertEqual(final[0].segment.id, first[0].segment.id)
+        XCTAssertEqual(final[0].segment.text, first[0].segment.text)
+        XCTAssertTrue(final[0].isFinal)
     }
 }

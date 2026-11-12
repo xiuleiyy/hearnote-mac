@@ -248,6 +248,9 @@ final class MeetingRecorder: ObservableObject {
         if let failure = systemRecording?.failure {
             recordFailure(failure, for: sessionID)
         }
+        if errorMessage == nil, let warning = systemRecording?.cleanupWarning {
+            errorMessage = warning
+        }
         guard !sources.isEmpty, let temporary, let destination else {
             clearSession(sessionID)
             if let temporary { try? FileManager.default.removeItem(at: temporary) }

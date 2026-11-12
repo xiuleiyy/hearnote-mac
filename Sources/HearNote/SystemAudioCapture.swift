@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import HearNoteCore
 import ScreenCaptureKit
 
 enum SystemAudioCaptureError: LocalizedError {
@@ -38,6 +39,7 @@ struct SystemAudioRecording {
     let frameCount: Int64
     let sampleRate: Double
     let failure: Error?
+    let cleanupWarning: String?
 
     var hasAudio: Bool { frameCount > 0 && sampleRate > 0 }
 }
@@ -54,6 +56,11 @@ final class SystemAudioCapture {
     private var captureStream: SCStream?
     private var sink: SystemAudioSink?
     private var outputURL: URL?
+    private var startTask: Task<Void, Error>?
+    private var stopOperation = AudioCaptureStopOperation<SystemAudioRecording?>()
+    private var generation = UUID()
+    private var starting = false
+    private var stopping = false
 
     /// Ask for system recording permission before either audio source starts.
     func prepare() async throws {
@@ -78,9 +85,14 @@ final class SystemAudioCapture {
     }
 
     func start(in directory: URL) async throws {
-        guard captureStream == nil else { return }
+        guard !starting, !stopping else { throw CancellationError() }
+        guard captureStream == nil, startTask == nil else { return }
+        starting = true
+        defer { starting = false }
+        let sessionID = generation
         if filter == nil { try await prepare() }
         try Task.checkCancellation()
+        guard generation == sessionID else { throw CancellationError() }
         guard let filter else { throw SystemAudioCaptureError.noDisplay }
         try FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true
@@ -117,15 +129,20 @@ final class SystemAudioCapture {
         sink = writer
         captureStream = stream
         outputURL = url
+        stopOperation = AudioCaptureStopOperation()
+        let startup = Task { try await stream.startCapture() }
+        startTask = startup
         do {
-            try await stream.startCapture()
+            try await startup.value
             try Task.checkCancellation()
+            guard generation == sessionID, captureStream === stream,
+                  !stopping else { throw CancellationError() }
+            startTask = nil
         } catch {
-            try? await stream.stopCapture()
-            _ = await writer.finish()
-            sink = nil
-            captureStream = nil
-            outputURL = nil
+            // stop/cancel may have entered while startCapture was suspended.
+            // They and this cleanup must await the same stop/flush.
+            _ = await stop()
+            if outputURL == url { outputURL = nil }
             try? FileManager.default.removeItem(at: url)
             if error is CancellationError { throw CancellationError() }
             throw SystemAudioCaptureError.streamFailed(error.localizedDescription)
@@ -133,27 +150,37 @@ final class SystemAudioCapture {
     }
 
     func stop() async -> SystemAudioRecording? {
-        guard let stream = captureStream, let writer = sink else { return nil }
-        let endHostTime = CMTimeGetSeconds(
-            CMClockGetTime(CMClockGetHostTimeClock())
-        )
-        // Detach our references before suspension so repeated stops are harmless.
-        captureStream = nil
-        sink = nil
-        do {
-            try await stream.stopCapture()
-        } catch {
-            writer.markFailure(
-                SystemAudioCaptureError.streamFailed(error.localizedDescription)
+        generation = UUID()
+        let operation = stopOperation
+        return await operation.run { [self] in
+            guard let stream = captureStream, let writer = sink else { return nil }
+            let endHostTime = CMTimeGetSeconds(
+                CMClockGetTime(CMClockGetHostTimeClock())
             )
+            stopping = true
+            writer.beginStopping(at: endHostTime)
+            captureStream = nil
+            sink = nil
+            let startup = startTask
+            startTask = nil
+            // Avoid asking ScreenCaptureKit to start and stop the same stream
+            // concurrently if cancellation arrives during startup.
+            if let startup { _ = try? await startup.value }
+            do {
+                try await stream.stopCapture()
+            } catch {
+                writer.markStreamFailure(error)
+            }
+            let result = await writer.finish(endingAt: endHostTime)
+            stopping = false
+            return result
         }
-        return await writer.finish(endingAt: endHostTime)
     }
 
     func cancel() async {
         let url = outputURL
         _ = await stop()
-        outputURL = nil
+        if outputURL == url { outputURL = nil }
         if let url { try? FileManager.default.removeItem(at: url) }
     }
 }
@@ -175,6 +202,9 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
     private var writtenFrames: Int64 = 0
     private var failure: Error?
     private var finished = false
+    private var cleanupWarning: String?
+    private let lifecycleLock = NSLock()
+    private var lifecycle = AudioCaptureLifecycle()
 
     init(
         url: URL,
@@ -212,6 +242,13 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
             guard hostTime.isFinite else {
                 throw SystemAudioCaptureError.invalidBuffer
             }
+            lifecycleLock.lock()
+            let acceptedFrames = lifecycle.acceptedFrameCount(
+                start: hostTime, sampleRate: pcm.format.sampleRate, frames: Int(pcm.frameLength)
+            )
+            lifecycleLock.unlock()
+            guard acceptedFrames > 0 else { return }
+            pcm.frameLength = AVAudioFrameCount(acceptedFrames)
             if file == nil {
                 format = pcm.format
                 file = try AVAudioFile(
@@ -260,13 +297,33 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        markFailure(SystemAudioCaptureError.streamFailed(error.localizedDescription))
+        markStreamFailure(error)
     }
 
-    func markFailure(_ error: Error) {
+    func beginStopping(at hostTime: TimeInterval) {
+        lifecycleLock.lock()
+        lifecycle.beginStopping(at: hostTime)
+        lifecycleLock.unlock()
+    }
+
+    func markStreamFailure(_ error: Error) {
+        // Classify at callback arrival, before its queued processing. A real
+        // interruption just before Stop remains a recording failure.
+        lifecycleLock.lock()
+        let disposition = lifecycle.streamErrorDisposition
+        lifecycleLock.unlock()
         queue.async { [self] in
             guard !finished else { return }
-            setFailure(error)
+            switch disposition {
+            case .recordingFailure:
+                setFailure(SystemAudioCaptureError.streamFailed(error.localizedDescription))
+            case .shutdownWarning:
+                if cleanupWarning == nil {
+                    cleanupWarning = "系统声音收尾报告：\(error.localizedDescription)。已采集的音频仍会保存。"
+                }
+            case .ignore:
+                break
+            }
         }
     }
 
@@ -298,13 +355,17 @@ private final class SystemAudioSink: NSObject, SCStreamOutput, SCStreamDelegate 
                 }
                 finished = true
                 file = nil // Flush/close before a composition reads the file.
+                lifecycleLock.lock()
+                lifecycle.finish()
+                lifecycleLock.unlock()
                 continuation.resume(
                     returning: SystemAudioRecording(
                         url: url,
                         firstHostTime: firstHostTime,
                         frameCount: writtenFrames,
                         sampleRate: format?.sampleRate ?? 0,
-                        failure: failure
+                        failure: failure,
+                        cleanupWarning: cleanupWarning
                     )
                 )
             }
