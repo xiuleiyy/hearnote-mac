@@ -154,12 +154,13 @@ final class BedrockClientTests: XCTestCase {
         XCTAssertTrue(path?.contains("%2Fexample/converse") == true)
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-key-never-used-on-network")
         XCTAssertEqual(request.httpMethod, "POST")
-        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+        let requestBody = try MockRequestBody.data(from: request)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
         let inference = try XCTUnwrap(body["inferenceConfig"] as? [String: Any])
         XCTAssertEqual(inference["maxTokens"] as? Int, 32)
         XCTAssertNil(inference["temperature"])
         XCTAssertNil(body["additionalModelRequestFields"])
-        XCTAssertFalse(String(data: request.httpBody!, encoding: .utf8)!.contains("test-key"))
+        XCTAssertFalse(try XCTUnwrap(String(data: requestBody, encoding: .utf8)).contains("test-key"))
     }
 
     func testSonnet55ReducesUpfrontThinkingWithoutChangingOtherModelRequests() throws {
@@ -171,7 +172,9 @@ final class BedrockClientTests: XCTestCase {
                 system: "system", text: "text", maxTokens: 32
             )
             XCTAssertTrue(request.url!.absoluteString.hasSuffix("/converse"))
-            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: MockRequestBody.data(from: request)
+            ) as? [String: Any])
             let fields = try XCTUnwrap(body["additionalModelRequestFields"] as? [String: Any])
             let thinking = try XCTUnwrap(fields["thinking"] as? [String: Any])
             let output = try XCTUnwrap(fields["output_config"] as? [String: Any])
@@ -183,7 +186,9 @@ final class BedrockClientTests: XCTestCase {
         let oldRequest = try client(modelID: "global.anthropic.claude-sonnet-4-6").makeRequest(
             system: "", text: "", maxTokens: 32
         )
-        let oldBody = try XCTUnwrap(JSONSerialization.jsonObject(with: oldRequest.httpBody!) as? [String: Any])
+        let oldBody = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: MockRequestBody.data(from: oldRequest)
+        ) as? [String: Any])
         XCTAssertNil(oldBody["additionalModelRequestFields"])
     }
 
@@ -194,7 +199,9 @@ final class BedrockClientTests: XCTestCase {
                 XCTAssertEqual(request.url?.host, "bedrock-runtime.us-east-1.amazonaws.com")
                 XCTAssertEqual(request.url?.path, "/openai/v1/chat/completions")
                 XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-key-never-used-on-network")
-                let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+                let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                    with: MockRequestBody.data(from: request)
+                ) as? [String: Any])
                 XCTAssertEqual(body["model"] as? String, modelID)
                 XCTAssertEqual(body["reasoning_effort"] as? String, "none")
                 XCTAssertNotNil(body["max_tokens"] as? Int)
@@ -232,13 +239,17 @@ final class BedrockClientTests: XCTestCase {
         ] {
             let request = try client(modelID: modelID).makeRequest(system: "", text: "", maxTokens: 32)
             XCTAssertEqual(request.url?.path, "/openai/v1/chat/completions")
-            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: MockRequestBody.data(from: request)
+            ) as? [String: Any])
             XCTAssertEqual(body["model"] as? String, modelID)
         }
         for modelID in ["moonshotai.kimi-k2.5", "moonshotai.kimi-k3.10"] {
             let request = try client(modelID: modelID).makeRequest(system: "", text: "", maxTokens: 32)
             XCTAssertTrue(request.url!.absoluteString.hasSuffix("/converse"))
-            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: MockRequestBody.data(from: request)
+            ) as? [String: Any])
             XCTAssertNil(body["reasoning_effort"])
             XCTAssertNotNil(body["inferenceConfig"])
         }
@@ -291,7 +302,9 @@ final class BedrockClientTests: XCTestCase {
     func testGLM53UsesLowReasoningAndLeavesRoomForTheConnectionResult() async throws {
         MockProtocol.handler = { request in
             XCTAssertTrue(request.url!.absoluteString.hasSuffix("/converse"))
-            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: MockRequestBody.data(from: request)
+            ) as? [String: Any])
             let fields = try XCTUnwrap(body["additionalModelRequestFields"] as? [String: Any])
             XCTAssertEqual(fields["reasoning_effort"] as? String, "low")
             XCTAssertNil(fields["thinking"])
@@ -309,7 +322,9 @@ final class BedrockClientTests: XCTestCase {
             XCTAssertEqual(request.url?.host, "bedrock-runtime.us-east-1.amazonaws.com")
             XCTAssertEqual(request.url?.path, "/openai/v1/responses")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-key-never-used-on-network")
-            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any])
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: MockRequestBody.data(from: request)
+            ) as? [String: Any])
             XCTAssertEqual(body["model"] as? String, "global.openai.gpt-5.6-sol")
             XCTAssertEqual((body["reasoning"] as? [String: String])?["effort"], "none")
             XCTAssertGreaterThanOrEqual(try XCTUnwrap(body["max_output_tokens"] as? Int), 256)
@@ -802,7 +817,7 @@ final class BedrockClientTests: XCTestCase {
 
     private static func requestTexts(_ request: URLRequest) throws -> (system: String, text: String) {
         let body = try XCTUnwrap(JSONSerialization.jsonObject(
-            with: XCTUnwrap(request.httpBody)
+            with: MockRequestBody.data(from: request)
         ) as? [String: Any])
         if let instructions = body["instructions"] as? String {
             let input = try XCTUnwrap(body["input"] as? [[String: String]])
@@ -861,6 +876,119 @@ final class BedrockClientTests: XCTestCase {
     }
 }
 
+final class MockRequestBodyTests: XCTestCase {
+    func testDataBodyIsPreservedWithTheRequestMetadata() throws {
+        let expected = Data("synthetic-data-body".utf8)
+        var request = URLRequest(url: try XCTUnwrap(URL(string: "https://example.invalid/mock")))
+        request.httpMethod = "POST"
+        request.setValue("synthetic-header", forHTTPHeaderField: "X-Test")
+        request.httpBody = expected
+
+        let normalized = try MockRequestBody.normalized(request)
+        XCTAssertEqual(try MockRequestBody.data(from: normalized), expected)
+        XCTAssertEqual(normalized.url, request.url)
+        XCTAssertEqual(normalized.httpMethod, request.httpMethod)
+        XCTAssertEqual(normalized.value(forHTTPHeaderField: "X-Test"), "synthetic-header")
+        XCTAssertNil(normalized.httpBodyStream)
+    }
+
+    func testStreamBodyIsCapturedOnceForRepeatedAssertions() throws {
+        let expected = Data(String(repeating: "中英 mixed 🌊", count: 1000).utf8)
+        let stream = InputStream(data: expected)
+        var request = URLRequest(url: try XCTUnwrap(URL(string: "https://example.invalid/mock")))
+        request.httpBodyStream = stream
+        XCTAssertNil(request.httpBody)
+
+        let normalized = try MockRequestBody.normalized(request)
+        XCTAssertNil(normalized.httpBodyStream)
+        XCTAssertEqual(stream.streamStatus, .closed)
+        XCTAssertEqual(try MockRequestBody.data(from: normalized), expected)
+        XCTAssertEqual(try MockRequestBody.data(from: normalized), expected)
+    }
+
+    func testMissingAndOversizedBodiesFailWithoutReturningPartialData() throws {
+        var request = URLRequest(url: try XCTUnwrap(URL(string: "https://example.invalid/mock")))
+        XCTAssertThrowsError(try MockRequestBody.data(from: request)) {
+            XCTAssertEqual($0 as? MockRequestBody.ReadError, .missingBody)
+        }
+
+        let expected = Data(repeating: 1, count: 33)
+        request.httpBody = expected
+        XCTAssertThrowsError(try MockRequestBody.data(from: request, maximumBytes: 32)) {
+            XCTAssertEqual($0 as? MockRequestBody.ReadError, .exceedsLimit)
+        }
+        let stream = InputStream(data: expected)
+        request.httpBody = nil
+        request.httpBodyStream = stream
+        XCTAssertThrowsError(try MockRequestBody.data(from: request, maximumBytes: 32)) {
+            XCTAssertEqual($0 as? MockRequestBody.ReadError, .exceedsLimit)
+        }
+        XCTAssertEqual(stream.streamStatus, .closed)
+    }
+
+    func testStreamReadFailureIsPropagatedAndClosesTheStream() throws {
+        let stream = FailingBodyStream()
+        var request = URLRequest(url: try XCTUnwrap(URL(string: "https://example.invalid/mock")))
+        request.httpBodyStream = stream
+        XCTAssertThrowsError(try MockRequestBody.data(from: request)) {
+            XCTAssertEqual(($0 as NSError).domain, stream.failure.domain)
+            XCTAssertEqual(($0 as NSError).code, stream.failure.code)
+        }
+        XCTAssertTrue(stream.wasClosed)
+    }
+}
+
+/// Darwin URLSession can replace httpBody with a one-shot httpBodyStream.
+/// Capture it at the protocol boundary so every assertion sees the same bytes.
+private enum MockRequestBody {
+    enum ReadError: Error, Equatable {
+        case missingBody
+        case exceedsLimit
+        case streamReadFailed
+    }
+
+    static func normalized(_ request: URLRequest) throws -> URLRequest {
+        let captured = try data(from: request)
+        var normalized = request
+        normalized.httpBodyStream = nil
+        normalized.httpBody = captured
+        return normalized
+    }
+
+    static func data(from request: URLRequest, maximumBytes: Int = 1_048_576) throws -> Data {
+        guard maximumBytes >= 0 else { throw ReadError.exceedsLimit }
+        if let body = request.httpBody {
+            guard body.count <= maximumBytes else { throw ReadError.exceedsLimit }
+            return body
+        }
+        guard let stream = request.httpBodyStream else { throw ReadError.missingBody }
+        stream.open()
+        defer { stream.close() }
+
+        var body = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count >= 0 else { throw stream.streamError ?? ReadError.streamReadFailed }
+            if count == 0 { return body }
+            guard count <= maximumBytes - body.count else { throw ReadError.exceedsLimit }
+            body.append(contentsOf: buffer.prefix(count))
+        }
+    }
+}
+
+private final class FailingBodyStream: InputStream {
+    let failure = NSError(domain: "MockRequestBodyTests", code: 1)
+    private(set) var wasClosed = false
+
+    init() { super.init(data: Data()) }
+
+    override var streamError: Error? { failure }
+    override func open() {}
+    override func close() { wasClosed = true }
+    override func read(_ buffer: UnsafeMutablePointer<UInt8>, maxLength len: Int) -> Int { -1 }
+}
+
 private final class MockProtocol: URLProtocol {
     static var handler: ((URLRequest) throws -> (Int, Data))?
 
@@ -872,7 +1000,8 @@ private final class MockProtocol: URLProtocol {
             guard let handler = Self.handler else {
                 throw URLError(.badServerResponse)
             }
-            let (status, data) = try handler(request)
+            let normalizedRequest = try MockRequestBody.normalized(request)
+            let (status, data) = try handler(normalizedRequest)
             let response = HTTPURLResponse(
                 url: request.url!,
                 statusCode: status,

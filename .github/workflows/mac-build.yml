@@ -1,0 +1,48 @@
+name: Mac 安装包
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Resources/**'
+      - 'scripts/**'
+      - 'Package.swift'
+      - 'Package.resolved'
+      - '.github/workflows/mac-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event.repository.private == true
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: 编译、测试、签名与安装包验证
+        env:
+          HEARNOTE_SOURCE_COMMIT: ${{ github.sha }}
+          HEARNOTE_BUILD_NUMBER: ${{ github.run_number }}
+          HEARNOTE_EXPECTED_ARCH: arm64
+        run: bash scripts/ci-mac.sh
+
+      - name: 保存安装包与真实日志
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: HearNote-Mac-arm64
+          path: dist/ci/
+          if-no-files-found: error
+          retention-days: 30

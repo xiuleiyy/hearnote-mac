@@ -42,7 +42,7 @@ App 自动按型号适配：Sonnet 使用 Converse 的 `between_tools` 与低 ef
 
 ## 在 Mac 上构建
 
-需要 macOS 14+ 和支持 Swift 5.10+ 的 Xcode 编译工具；WhisperKit 官方建议 Xcode 16 或更新版本。首次构建会从 GitHub 下载精确版本 `1.1.1` 的 WhisperKit 和它的依赖。
+需要 macOS 14+、Swift 5.10+ 和已完成首次初始化的完整 Xcode，建议 Xcode 16 或更新版本。Core 测试需要 Xcode 提供的 XCTest，仅安装 Command Line Tools 不够。首次构建会从 GitHub 下载精确版本 `1.1.1` 的 WhisperKit 和它的依赖。
 
 仓库为 private，需要当前 GitHub 账号有访问权限。登录 GitHub 后取得源码：
 
@@ -52,11 +52,13 @@ cd hearnote-mac
 bash scripts/build-mac.sh --open
 ```
 
-也可双击 `开始使用.command`。首次缺少编译工具时，先运行 `xcode-select --install`。
+也可双击 `开始使用.command`。首次缺少编译工具时，安装并打开完整 Xcode，完成许可证与组件初始化，再在 Xcode → Settings → Locations 选择编译工具。
 
 脚本先执行 `swift test`，再编译并生成 `dist/HearNote.app`，复制依赖的资源 bundle，最后做本地 ad-hoc 签名。构建不安装后台服务，不发布 App Store。生成的 `.app` 可复制到 Mac 的 `/Applications`；当前未进行 Developer ID 签名或公证。
 
-本机验收成功后执行 `bash scripts/package-mac.sh`，生成 `dist/HearNote.dmg`；打开后将 App 拖到 Applications。该脚本使用已构建的 App，不重复编译和测试。当前仓库交付源码，尚未提供经 Mac 实机验收的二进制安装包。
+本机验收成功后执行 `bash scripts/package-mac.sh`，生成 `dist/HearNote.dmg`；打开后将 App 拖到 Applications。该脚本使用已构建的 App，不重复编译和测试。
+
+仓库的“Mac 安装包”GitHub Actions 使用 macOS arm64 runner 运行相同构建脚本。成功时产出 App ZIP、DMG、含依赖锁文件的源码 ZIP、真实日志、修复 diff 和 SHA-256；登录 GitHub 后在成功运行的 Artifacts 下载 `HearNote-Mac-arm64`。CI 验证构建、签名、移动后启动与镜像挂载，音频、GUI 和真实模型调用仍需 Mac 功能验收。
 
 ## 独立翻译
 
@@ -104,7 +106,7 @@ bash scripts/build-mac.sh --open
 
 ## 验证状态
 
-当前 Core XCTest 53 项全部通过，包含导出、本地库、API Key 调用、多模型协议、中英双向请求、实时翻译开关、排队和修订保护。Mac 源码通过 Swift 原生 parser；WhisperKit 接口已按官方 `v1.1.1` 源码核对。此前验证环境没有 Apple SDK，完整 macOS typecheck、`.app` 构建和真实音频功能仍需本机验收。
+本机反馈发现播放器析构的 actor 隔离编译错误，以及测试 mock 未读取 Darwin 请求体 stream。这两处已修复，Linux Core XCTest 57 项通过，包含导出、本地库、API Key 调用、多模型协议、中英双向请求、实时翻译开关、排队、修订保护及请求体 stream 回归。macOS 完整构建结果以对应提交的“Mac 安装包”CI 日志为准。
 
 具体步骤见 [Mac 本机验收](docs/Mac本机验收.md)。准确率、实际翻译延迟、会议持续录音稳定性尚未经过 Mac 实机测量，不给未经验证的保证。
 
@@ -117,6 +119,8 @@ Tests/HearNoteCoreTests/   不产生模型费用的核心测试
 Resources/                App 信息、权限用途与签名 entitlement
 scripts/build-mac.sh      Mac 测试、构建、打包
 scripts/package-mac.sh    将已构建 App 打成 DMG
+scripts/ci-mac.sh         macOS CI 构建、验证与安装包归档
+scripts/verify-mac-build.sh  架构、签名、移动后启动与 DMG 挂载
 docs/                     安装与 Mac 实机验收
 ```
 

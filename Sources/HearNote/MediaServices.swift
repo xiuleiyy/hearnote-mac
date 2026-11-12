@@ -43,6 +43,52 @@ enum MediaServiceError: LocalizedError {
     }
 }
 
+/// 将 observer 与注册它的播放器一起持有；析构时不读取 UI 对象的 actor 隔离状态。
+private final class MediaPlayerResources {
+    private let player: AVPlayer
+    private var timeObserver: Any?
+    private var endObserver: NSObjectProtocol?
+    private var durationTask: Task<Void, Never>?
+
+    init(player: AVPlayer, timeObserver: Any, endObserver: NSObjectProtocol,
+         durationTask: Task<Void, Never>) {
+        self.player = player
+        self.timeObserver = timeObserver
+        self.endObserver = endObserver
+        self.durationTask = durationTask
+    }
+
+    /// 正常换文件时立即清理；清空 token，避免后续析构再次移除。
+    @MainActor
+    func invalidate() {
+        durationTask?.cancel()
+        durationTask = nil
+        player.pause()
+        if let timeObserver { player.removeTimeObserver(timeObserver) }
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        timeObserver = nil
+        endObserver = nil
+    }
+
+    deinit {
+        durationTask?.cancel()
+        // 最后一次 release 可能来自任意线程。只移交资源快照，不捕获正在析构的 self。
+        guard timeObserver != nil || endObserver != nil else { return }
+        let retainedPlayer = player
+        let remainingTimeObserver = timeObserver
+        let remainingEndObserver = endObserver
+        DispatchQueue.main.async {
+            retainedPlayer.pause()
+            if let remainingTimeObserver {
+                retainedPlayer.removeTimeObserver(remainingTimeObserver)
+            }
+            if let remainingEndObserver {
+                NotificationCenter.default.removeObserver(remainingEndObserver)
+            }
+        }
+    }
+}
+
 @MainActor
 final class MediaPlayer: ObservableObject {
     @Published private(set) var isPlaying = false
@@ -51,9 +97,7 @@ final class MediaPlayer: ObservableObject {
     @Published private(set) var player: AVPlayer?
     @Published private(set) var errorMessage: String?
 
-    private var timeObserver: Any?
-    private var endObserver: NSObjectProtocol?
-    private var durationTask: Task<Void, Never>?
+    private var resources: MediaPlayerResources?
     private var generation = UUID()
     private var playbackRate: Float = 1
 
@@ -69,7 +113,7 @@ final class MediaPlayer: ObservableObject {
         let newPlayer = AVPlayer(playerItem: item)
         player = newPlayer
         let expectedGeneration = generation
-        timeObserver = newPlayer.addPeriodicTimeObserver(
+        let timeObserver = newPlayer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.15, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
@@ -83,7 +127,7 @@ final class MediaPlayer: ObservableObject {
                 }
             }
         }
-        endObserver = NotificationCenter.default.addObserver(
+        let endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
@@ -94,7 +138,7 @@ final class MediaPlayer: ObservableObject {
                 self.currentTime = self.duration
             }
         }
-        durationTask = Task { [weak self] in
+        let durationTask = Task { [weak self] in
             do {
                 let time = try await asset.load(.duration)
                 guard let self, !Task.isCancelled,
@@ -105,6 +149,10 @@ final class MediaPlayer: ObservableObject {
                 self.errorMessage = error.localizedDescription
             }
         }
+        resources = MediaPlayerResources(
+            player: newPlayer, timeObserver: timeObserver, endObserver: endObserver,
+            durationTask: durationTask
+        )
     }
 
     func toggle() {
@@ -140,21 +188,10 @@ final class MediaPlayer: ObservableObject {
     }
 
     private func cleanup() {
-        durationTask?.cancel()
-        durationTask = nil
-        player?.pause()
-        if let timeObserver { player?.removeTimeObserver(timeObserver) }
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        timeObserver = nil
-        endObserver = nil
+        resources?.invalidate()
+        resources = nil
         player = nil
         isPlaying = false
-    }
-
-    deinit {
-        durationTask?.cancel()
-        if let timeObserver { player?.removeTimeObserver(timeObserver) }
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
     }
 }
 

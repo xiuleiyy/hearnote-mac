@@ -34,10 +34,12 @@
 
 - Core 的检查：`swift test`。Core 测试不调用真实模型、不产生模型费用。
 
-- Mac 的完整构建：`bash scripts/build-mac.sh`。必须在 macOS 14+、Swift 5.10+ 的编译环境运行，建议 Xcode 16 或更新版本。
+- Mac 的完整构建：`bash scripts/build-mac.sh`。必须在 macOS 14+、Swift 5.10+、已完成初始化的完整 Xcode 环境运行，建议 Xcode 16 或更新版本；仅 Command Line Tools 不提供所需的完整 XCTest 环境。
 
 - 功能验收：按 `docs/Mac本机验收.md` 执行；不得将 parser 检查或 Core 测试当成 Mac UI、音频、OCR、朗读或会议持续录音已经验证。
 
 - 安装与打包：见 `docs/安装使用.md`；`bash scripts/package-mac.sh` 使用已构建的 App 生成本机 DMG。
+
+- 正常源码修改推送到 `main` 后会触发“Mac 安装包”CI。等待真实构建结果并处理失败，取回 App ZIP、DMG、源码 ZIP 与日志供用户下载；CI 成功不能标记为用户 Mac 的音频、GUI 或北京延迟验收通过。
 
 变更说明应写清实现、检查结果和实际限制；不保证未经测量的准确率、北京网络延迟或模型速度排名。型号和参数要按可验证的官方资料确认，不猜测模型 ID。

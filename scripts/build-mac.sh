@@ -6,7 +6,18 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 1
 fi
 if ! xcrun --find swift >/dev/null 2>&1; then
-    echo "未找到 Swift 编译器。请先运行 xcode-select --install，再重新构建。"
+    echo "未找到 Swift 编译器。请安装完整 Xcode 并完成首次初始化，再重新构建。"
+    exit 1
+fi
+hearnote_developer_dir="$(xcode-select -p)"
+if [[ ! -d "$hearnote_developer_dir/Platforms/MacOSX.platform/Developer/Library/Frameworks/XCTest.framework" ]] ||
+   ! xcodebuild -version >/dev/null 2>&1; then
+    echo "构建和 Core 测试需要完整 Xcode（含 XCTest），仅 Command Line Tools 不够。"
+    echo "请安装并打开 Xcode 完成初始化，在 Xcode → Settings → Locations 选择编译工具。"
+    exit 1
+fi
+if ! xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1; then
+    echo "Xcode 尚未完成首次初始化。请打开 Xcode 确认许可证并安装所需组件，再重新构建。"
     exit 1
 fi
 hearnote_swift_version="$(swift --version)"
@@ -23,15 +34,41 @@ swift test
 swift build -c release
 binary_dir="$(swift build -c release --show-bin-path)"
 app_path="$project_root/dist/HearNote.app"
-mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
-cp "$binary_dir/HearNote" "$app_path/Contents/MacOS/HearNote"
-cp "$project_root/Resources/Info.plist" "$app_path/Contents/Info.plist"
+mkdir -p "$project_root/dist"
+hearnote_stage="$(mktemp -d "$project_root/dist/.hearnote-build.XXXXXX")"
+hearnote_stage_app="$hearnote_stage/HearNote.app"
+hearnote_cleanup() {
+    if [[ -d "$hearnote_stage/previous.app" && ! -e "$app_path" ]]; then
+        mv "$hearnote_stage/previous.app" "$app_path"
+    fi
+    rm -rf "$hearnote_stage"
+}
+trap hearnote_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -p "$hearnote_stage_app/Contents/MacOS" "$hearnote_stage_app/Contents/Resources"
+cp "$binary_dir/HearNote" "$hearnote_stage_app/Contents/MacOS/HearNote"
+cp "$project_root/Resources/Info.plist" "$hearnote_stage_app/Contents/Info.plist"
+if [[ -n "${HEARNOTE_SOURCE_COMMIT:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Add :HearNoteSourceCommit string $HEARNOTE_SOURCE_COMMIT" \
+        "$hearnote_stage_app/Contents/Info.plist"
+fi
+if [[ "${HEARNOTE_BUILD_NUMBER:-}" =~ ^[0-9]+$ ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $HEARNOTE_BUILD_NUMBER" \
+        "$hearnote_stage_app/Contents/Info.plist"
+fi
 shopt -s nullglob
 for hearnote_resource_bundle in "$binary_dir"/*.bundle; do
-    cp -R "$hearnote_resource_bundle" "$app_path/Contents/Resources/"
+    # SwiftPM 的 Bundle.module 首先在 Bundle.main.bundleURL 下寻找 bundle。
+    # 当前生产依赖没有资源；若以后引入资源，也必须能脱离 .build 定位。
+    cp -R "$hearnote_resource_bundle" "$hearnote_stage_app/"
 done
-codesign --force --sign - --entitlements "$project_root/Resources/HearNote.entitlements" "$app_path"
-codesign --verify --strict "$app_path"
+codesign --force --sign - --entitlements "$project_root/Resources/HearNote.entitlements" "$hearnote_stage_app"
+codesign --verify --strict "$hearnote_stage_app"
+if [[ -e "$app_path" ]]; then
+    mv "$app_path" "$hearnote_stage/previous.app"
+fi
+mv "$hearnote_stage_app" "$app_path"
 echo "已构建：$app_path"
 if [[ "${1:-}" == "--open" ]]; then
     open "$app_path"
