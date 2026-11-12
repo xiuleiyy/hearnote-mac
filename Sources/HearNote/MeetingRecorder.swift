@@ -90,8 +90,8 @@ final class MeetingRecorder: ObservableObject {
     private var receivedSystemBuffer = false
     private var capturedMicrophoneDuration: Double = 0
     private var capturedSystemDuration: Double = 0
-    private var lastMicrophoneBufferAt = Double.negativeInfinity
-    private var lastSystemBufferAt = Double.negativeInfinity
+    private var lastMicrophoneBufferAt = -Double.infinity
+    private var lastSystemBufferAt = -Double.infinity
     private var timerTask: Task<Void, Never>?
     private var activeExport: AVAssetExportSession?
 
@@ -112,8 +112,8 @@ final class MeetingRecorder: ObservableObject {
         systemAudioDuration = 0
         microphoneAudioLevel = 0
         systemAudioLevel = 0
-        lastMicrophoneBufferAt = .negativeInfinity
-        lastSystemBufferAt = .negativeInfinity
+        lastMicrophoneBufferAt = -Double.infinity
+        lastSystemBufferAt = -Double.infinity
         firstMicrophoneOffset = 0
         firstSystemOffset = 0
         currentMicrophoneOffset = 0
