@@ -21,6 +21,10 @@ public struct LiveTranslationQueue {
 
     public var hasPending: Bool { !pending.isEmpty }
 
+    public func isPending(for segment: TranscriptSegment) -> Bool {
+        pending[segment.id]?.segment.text == segment.text
+    }
+
     public mutating func update(_ segment: TranscriptSegment, isFinal: Bool, now: Date) {
         guard translatedTexts[segment.id] != segment.text else { return }
 

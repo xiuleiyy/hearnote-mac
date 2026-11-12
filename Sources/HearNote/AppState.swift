@@ -114,6 +114,7 @@ struct AppPreferences: Codable {
 }
 
 enum DetailTab: String, CaseIterable {
+    case comparison = "对照"
     case transcript = "原文"
     case translation = "翻译"
     case summary = "摘要"
@@ -140,6 +141,8 @@ final class AppState: ObservableObject {
     @Published var lastLatency: Double?
     @Published var liveTranslations: [UUID: String] = [:]
     @Published var liveTranslationStatus = ""
+    @Published private(set) var translatingSegment: TranscriptSegment?
+    @Published private(set) var liveTranslationError: String?
     @Published var liveRecognitionWarning = ""
     @Published var translateLive = true
     @Published var liveDocumentID: UUID?
@@ -263,12 +266,24 @@ final class AppState: ObservableObject {
     }
     func updateText(documentID: UUID, segmentID: UUID, text: String) {
         updateDocument(documentID) { document in
-            guard let index = document.segments.firstIndex(where: { $0.id == segmentID }) else { return }
+            guard let index = document.segments.firstIndex(where: { $0.id == segmentID }),
+                  document.segments[index].text != text else { return }
             document.segments[index].text = text
             // 编辑原文后，旧的翻译和摘要失效，避免展示不匹配的结果。
+            document.segments[index].translation = nil
             document.translation = ""
             document.summary = ""
         }
+    }
+    func translationStatus(documentID: UUID, segment: TranscriptSegment) -> String {
+        guard liveDocumentID == documentID else { return "未翻译" }
+        if liveTranslationError != nil { return "翻译已暂停" }
+        if !translateLive { return "实时翻译已关闭" }
+        if translatingSegment?.id == segment.id && translatingSegment?.text == segment.text {
+            return "正在翻译…"
+        }
+        if translationQueue.isPending(for: segment) { return "等待译文…" }
+        return "未翻译"
     }
     func removeDocument(_ id: UUID) {
         guard id != liveDocumentID, !isBusy else { return }
@@ -377,6 +392,7 @@ final class AppState: ObservableObject {
         }
     }
     func runAI(_ tab: DetailTab) {
+        guard tab == .translation || tab == .summary else { return }
         guard let document = selectedDocument, !document.segments.isEmpty,
               !isBusy, !recorder.isRecording else { return }
         do {
@@ -519,9 +535,12 @@ final class AppState: ObservableObject {
             documents.insert(document, at: 0)
             liveDocumentID = document.id
             selection = document.id
+            detailTab = .comparison
             liveTranslations = [:]; translationQueue = LiveTranslationQueue()
             if !translateLive { translationQueue.suspend() }
             liveTranslationStatus = ""
+            translatingSegment = nil
+            liveTranslationError = nil
             try await recorder.start(in: recordingDirectory, source: source)
             if isQuitting { throw CancellationError() }
             if !recognitionWarnings.isEmpty {
@@ -555,7 +574,11 @@ final class AppState: ObservableObject {
             return
         }
         if let existing = documents[index].segments.firstIndex(where: { $0.id == segment.id }) {
-            documents[index].segments[existing] = segment
+            let previous = documents[index].segments[existing]
+            var updated = segment
+            // 仅时间戳变化时保留译文；文字修订后立即清除，之后恢复旧文字也不复活旧结果。
+            updated.translation = previous.text == segment.text ? previous.validTranslation : nil
+            documents[index].segments[existing] = updated
         } else { documents[index].segments.append(segment) }
         documents[index].segments.sort { $0.start < $1.start }
         translationQueue.update(segment, isFinal: final, now: Date())
@@ -568,6 +591,7 @@ final class AppState: ObservableObject {
     func setLiveTranslationEnabled(_ enabled: Bool) {
         guard translateLive != enabled else { return }
         translateLive = enabled
+        liveTranslationError = nil
         if !enabled {
             liveTranslationTask?.cancel()
             liveTranslationTask = nil
@@ -603,7 +627,11 @@ final class AppState: ObservableObject {
             let language = preferences.targetLanguage
             let configuration = preferences.configuration
             isTranslatingLive = true
-            defer { isTranslatingLive = false }
+            translatingSegment = segment
+            defer {
+                isTranslatingLive = false
+                if translatingSegment?.id == segment.id { translatingSegment = nil }
+            }
             liveTranslationStatus = "正在翻译…"
             let started = Date()
             let result = try await client.translate(segments: [segment], targetLanguage: language)
@@ -616,8 +644,20 @@ final class AppState: ObservableObject {
                     of: #"^\[\d{2}:\d{2}(?::\d{2})?\]\s*(?:〔[^〕]*〕\s*)?"#,
                     with: "", options: .regularExpression
                 )
+                guard !translation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw BedrockError.invalidResponse
+                }
                 if translationQueue.commit(translation, for: segment) {
                     liveTranslations = translationQueue.translations
+                    if let id = liveDocumentID {
+                        updateDocument(id) { document in
+                            guard let index = document.segments.firstIndex(where: { $0.id == segment.id }),
+                                  document.segments[index].text == segment.text else { return }
+                            document.segments[index].translation = SegmentTranslation(
+                                sourceText: segment.text, text: translation, targetLanguage: language
+                            )
+                        }
+                    }
                 }
             }
             lastLatency = Date().timeIntervalSince(started)
@@ -627,6 +667,7 @@ final class AppState: ObservableObject {
             guard !Task.isCancelled else { return }
             // 停止重复的失败调用，原文和录音继续。
             setLiveTranslationEnabled(false)
+            liveTranslationError = error.localizedDescription
             liveTranslationStatus = "翻译已暂停：\(error.localizedDescription)"
             translationQueue.clearPending()
         }
@@ -658,7 +699,7 @@ final class AppState: ObservableObject {
         if let id = finishedID {
             updateDocument(id) { document in
                 document.translation = document.segments.compactMap { segment in
-                    guard let translation = translationQueue.translation(for: segment) else {
+                    guard let translation = segment.validTranslation?.text else {
                         return "[\(Self.clock(segment.start))] 待翻译：结束时尚未完成，可点击“翻译全文”。"
                     }
                     return "[\(Self.clock(segment.start))] \(translation)"
@@ -667,6 +708,8 @@ final class AppState: ObservableObject {
             }
         }
         liveDocumentID = nil
+        translatingSegment = nil
+        detailTab = .comparison
         showRecording = false
         if let document = documents.first(where: { $0.id == finishedID }) { select(document) }
     }

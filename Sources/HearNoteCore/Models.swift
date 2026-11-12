@@ -1,18 +1,44 @@
 import Foundation
 
+public struct SegmentTranslation: Codable, Equatable, Sendable {
+    public var sourceText: String
+    public var text: String
+    public var targetLanguage: String
+
+    public init(sourceText: String, text: String, targetLanguage: String) {
+        self.sourceText = sourceText
+        self.text = text
+        self.targetLanguage = targetLanguage
+    }
+}
+
 public struct TranscriptSegment: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var start: Double
     public var end: Double
     public var text: String
     public var source: String?
+    public var translation: SegmentTranslation?
 
-    public init(id: UUID = UUID(), start: Double = 0, end: Double = 0, text: String, source: String? = nil) {
+    public init(
+        id: UUID = UUID(), start: Double = 0, end: Double = 0, text: String,
+        source: String? = nil, translation: SegmentTranslation? = nil
+    ) {
         self.id = id
         self.start = start
         self.end = end
         self.text = text
         self.source = source
+        self.translation = translation
+    }
+
+    /// 对照只使用与当前原文完全匹配的译文；旧结果仍需由调用方在修订时清除。
+    public var validTranslation: SegmentTranslation? {
+        guard let translation, translation.sourceText == text,
+              !translation.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return translation
     }
 }
 
