@@ -11,18 +11,21 @@ struct HearNoteApp: App {
         WindowGroup {
             WorkspaceView()
                 .environmentObject(state)
-                .frame(minWidth: 960, minHeight: 650)
+                .frame(minWidth: 900, minHeight: 600)
                 .task { delegate.state = state; state.presentSetupIfNeeded() }
         }
         .defaultSize(width: 1200, height: 780)
-        .windowStyle(.hiddenTitleBar)
+        .windowStyle(.titleBar)
+        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("导入音视频或文字…") { state.workspaceTab = .notes; state.importDocument() }
                     .keyboardShortcut("o", modifiers: [.command])
-                Button("开始会议录音") { state.workspaceTab = .notes; state.showRecording = true }
+                Button(state.liveDocumentID == nil ? "开始会议录音" : "返回当前会议") {
+                    state.openMeetingWorkspace()
+                }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
-                Button("打开翻译") { state.workspaceTab = .translation }
+                Button("打开翻译") { state.workspaceTab = .translation; state.showRecording = false }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
             }
             CommandGroup(replacing: .appSettings) {

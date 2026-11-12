@@ -224,6 +224,15 @@ final class AppState: ObservableObject {
     func presentSetupIfNeeded() {
         if !preferences.hasCompletedSetup { showSettings = true }
     }
+    func openMeetingWorkspace() {
+        guard !isQuitting else { return }
+        workspaceTab = .notes
+        showRecording = true
+        if let id = liveDocumentID {
+            selection = id
+            player.stop()
+        }
+    }
     func persistPreferences() {
         guard let data = try? JSONEncoder().encode(preferences) else { return }
         UserDefaults.standard.set(data, forKey: "HearNote.preferences")
@@ -338,6 +347,8 @@ final class AppState: ObservableObject {
                 )
                 documents.insert(document, at: 0)
                 select(document)
+                workspaceTab = .notes
+                showRecording = false
                 persist()
                 return
             }
@@ -353,6 +364,8 @@ final class AppState: ObservableObject {
                                         mediaFilename: filename, duration: duration, sourceKind: kind)
             documents.insert(document, at: 0)
             select(document)
+            workspaceTab = .notes
+            showRecording = false
             persist()
             busyMessage = nil
             isImporting = false
@@ -798,6 +811,7 @@ final class AppState: ObservableObject {
         liveRecognitionStatus = recordingSaved ? "录音已保存" : "录音未完成保存，请查看错误和原始音频位置。"
         translatingSegment = nil
         detailTab = .comparison
+        workspaceTab = .notes
         showRecording = false
         if let document = documents.first(where: { $0.id == finishedID }) { select(document) }
     }

@@ -457,14 +457,10 @@ final class WhisperSpeechService: ObservableObject {
         }
     }
 
-    fileprivate struct TimedWord {
-        let start: Double
-        let end: Double
-        let text: String
-    }
+    fileprivate typealias TimedWord = WhisperTranscriptCleaner.TimedWord
 
     fileprivate static func words(from results: [TranscriptionResult]) -> [TimedWord] {
-        results.flatMap(\.segments).flatMap { segment -> [TimedWord] in
+        let words = results.flatMap(\.segments).flatMap { segment -> [TimedWord] in
             // Whisper 的无语音判定和低置信度结果同时成立时，避免静音幻觉。
             guard !(segment.noSpeechProb >= 0.6 && segment.avgLogprob < -1) else { return [] }
             if let words = segment.words, !words.isEmpty {
@@ -479,7 +475,8 @@ final class WhisperSpeechService: ObservableObject {
             guard start.isFinite, end.isFinite, end >= start,
                   !segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
             return [TimedWord(start: max(0, start), end: end, text: segment.text)]
-        }.sorted { $0.start < $1.start }
+        }
+        return WhisperTranscriptCleaner.removingBlankAudio(from: words).sorted { $0.start < $1.start }
     }
 
     fileprivate static func hasAudio(_ samples: [Float]) -> Bool {

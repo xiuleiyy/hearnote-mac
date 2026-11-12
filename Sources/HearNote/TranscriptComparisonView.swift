@@ -2,15 +2,21 @@
 import SwiftUI
 import HearNoteCore
 
-/// 原文和译文共用一行、一条滚动轴，长译文不会把后续片段挤到另一行。
+/// 每个片段原文在上、译文在下，共用一条滚动轴。
 @MainActor
 struct TranscriptComparisonView: View {
     @EnvironmentObject private var state: AppState
+    @Environment(\.colorScheme) private var colorScheme
     let documentID: UUID
     let segments: [TranscriptSegment]
     let isLive: Bool
     @State private var followsLatest = true
     private let bottomID = "transcript-comparison-bottom"
+    private var translationColor: Color {
+        colorScheme == .dark
+            ? Color(red: 0.92, green: 0.79, blue: 0.43)
+            : Color(red: 0.45, green: 0.32, blue: 0.10)
+    }
 
     private struct ContentChange: Equatable {
         let id: UUID
@@ -39,12 +45,8 @@ struct TranscriptComparisonView: View {
                         }.disabled(segments.isEmpty)
                     }.font(.callout).padding(.horizontal, 20).padding(.vertical, 10)
                 }
-                HStack(spacing: 24) {
-                    Label("原文", systemImage: "waveform")
-                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-                    Label("翻译", systemImage: "character.bubble")
-                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-                }
+                Label(isLive ? "实时字幕" : "原文与翻译", systemImage: "text.bubble")
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .font(.callout.weight(.semibold))
                 .padding(.horizontal, 20).padding(.vertical, 12)
                 .background(Palette.accent.opacity(0.06))
@@ -52,7 +54,7 @@ struct TranscriptComparisonView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         if segments.isEmpty {
-                            Text(isLive ? "正在聆听，原文和译文会逐段显示在两侧。" : "这份笔记还没有原文。")
+                            Text("识别后逐段显示，原文在上、译文在下。")
                                 .font(.callout).foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, minHeight: 170)
                         }
@@ -91,13 +93,13 @@ struct TranscriptComparisonView: View {
                     Text(translation.targetLanguage)
                 }
             }.font(.caption).foregroundStyle(.secondary)
-            HStack(alignment: .top, spacing: 24) {
+            VStack(alignment: .leading, spacing: 10) {
                 Text(segment.text)
                     .foregroundStyle(.primary)
                     .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 Group {
                     if let translation = segment.validTranslation {
-                        Text(translation.text).foregroundStyle(Palette.accent)
+                        Text(translation.text).foregroundStyle(translationColor)
                     } else {
                         Text(state.translationStatus(documentID: documentID, segment: segment))
                             .foregroundStyle(.secondary)
