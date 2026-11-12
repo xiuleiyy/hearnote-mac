@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "hearnote-bedrock-api-key"
+description = "Amazon Bedrock API Key must stay in the macOS Keychain."
+regex = '''\bABSK[A-Za-z0-9+/=]{40,}'''
+keywords = ["ABSK"]
