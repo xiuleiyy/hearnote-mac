@@ -20,6 +20,9 @@ struct WorkspaceView: View {
     private var hasCurrentMeeting: Bool {
         state.liveDocumentID != nil || state.isStartingRecording || state.isStoppingRecording
     }
+    private var isRecordingWorkspace: Bool {
+        state.workspaceTab == .notes && state.showRecording
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -154,41 +157,118 @@ struct WorkspaceView: View {
         }.buttonStyle(.plain)
     }
     private var toolbar: some View {
-        HStack(spacing: 14) {
-            Text(state.workspaceTab == .translation ? "翻译" : (state.showRecording ? "会议录音" : "音视频笔记"))
-                .font(.callout).foregroundStyle(.secondary)
-            Spacer()
-            Menu {
+        Group {
+            if isRecordingWorkspace {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        meetingToolbarTitle
+                        Spacer(minLength: 8)
+                        regionMenu
+                        modelMenu
+                        if !hasCurrentMeeting { importButton }
+                        returnToNotesButton
+                    }
+                    HStack(spacing: 10) {
+                        meetingToolbarTitle
+                        Spacer(minLength: 4)
+                        compactModelMenu
+                        if !hasCurrentMeeting { importButton }
+                        returnToNotesButton
+                    }
+                }
+            } else {
+                HStack(spacing: 14) {
+                    Text(state.workspaceTab == .translation ? "翻译" : "音视频笔记")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Spacer()
+                    regionMenu
+                    modelMenu
+                    if state.workspaceTab == .notes {
+                        importButton
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, isRecordingWorkspace ? 18 : 26)
+        .padding(.vertical, isRecordingWorkspace ? 10 : 19)
+    }
+    private var importButton: some View {
+        Button { state.importDocument() } label: { Label("导入", systemImage: "plus") }
+            .buttonStyle(.bordered)
+            .disabled(state.isBusy || state.recorder.isRecording)
+            .help(state.recorder.isRecording
+                  ? "会议仍在录音，请先结束并保存，再导入文件。"
+                  : (state.isBusy
+                     ? (state.busyMessage ?? "正在处理当前操作，请稍候再导入。")
+                     : "导入音视频或文字"))
+    }
+    private var meetingToolbarTitle: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "waveform").foregroundStyle(Palette.accent)
+            Text(state.isStoppingRecording ? "正在保存会议" :
+                    (state.isStartingRecording ? "正在开始录音" :
+                        (hasCurrentMeeting ? "正在记录会议" : "开始会议录音")))
+                .font(.callout.weight(.semibold))
+            if hasCurrentMeeting {
+                RecordingTimerView(recorder: state.recorder)
+                    .font(.caption)
+            }
+        }.fixedSize()
+    }
+    private var returnToNotesButton: some View {
+        Button {
+            state.showRecording = false
+            state.workspaceTab = .notes
+        } label: {
+            Label("返回笔记", systemImage: "arrow.left")
+                .font(.caption).foregroundStyle(.primary)
+        }
+        .buttonStyle(.borderless).fixedSize()
+        .help(hasCurrentMeeting ? "录音继续，可从侧栏返回当前会议。" : "返回笔记列表。")
+    }
+    private var regionMenu: some View {
+        Menu {
+            ForEach(SettingsView.regions, id: \.id) { item in
+                Button(item.name) { state.selectRegion(item.id) }
+            }
+            Divider()
+            Button("其他 Region…") { state.showSettings = true }
+        } label: {
+            Label(SettingsView.regionName(state.preferences.region), systemImage: "globe.asia.australia")
+                .font(.caption).foregroundStyle(.primary).lineLimit(1)
+        }.menuStyle(.borderlessButton).frame(maxWidth: 120)
+    }
+    private var modelMenu: some View {
+        Menu {
+            ForEach(state.preferences.models) { model in
+                Button(model.name) { state.selectModel(model.modelID) }
+            }
+            Divider()
+            Button("管理模型…") { state.showSettings = true }
+        } label: {
+            Label(state.activeModelName, systemImage: "sparkles")
+                .font(.caption).foregroundStyle(.primary).lineLimit(1)
+        }.menuStyle(.borderlessButton).frame(maxWidth: 220)
+    }
+    private var compactModelMenu: some View {
+        Menu {
+            Section("Region") {
                 ForEach(SettingsView.regions, id: \.id) { item in
                     Button(item.name) { state.selectRegion(item.id) }
                 }
-                Divider()
                 Button("其他 Region…") { state.showSettings = true }
-            } label: {
-                Label(SettingsView.regionName(state.preferences.region), systemImage: "globe.asia.australia")
-                    .font(.caption).foregroundStyle(.primary).lineLimit(1)
-            }.menuStyle(.borderlessButton).frame(maxWidth: 120)
-            Menu {
+            }
+            Section("模型") {
                 ForEach(state.preferences.models) { model in
                     Button(model.name) { state.selectModel(model.modelID) }
                 }
-                Divider()
                 Button("管理模型…") { state.showSettings = true }
-            } label: {
-                Label(state.activeModelName, systemImage: "sparkles")
-                    .font(.caption).foregroundStyle(.primary).lineLimit(1)
-            }.menuStyle(.borderlessButton).frame(maxWidth: 220)
-            if state.workspaceTab == .notes {
-                Button { state.importDocument() } label: { Label("导入", systemImage: "plus") }
-                    .buttonStyle(.bordered)
-                    .disabled(state.isBusy || state.recorder.isRecording)
-                    .help(state.recorder.isRecording
-                          ? "会议仍在录音，请先结束并保存，再导入文件。"
-                          : (state.isBusy
-                             ? (state.busyMessage ?? "正在处理当前操作，请稍候再导入。")
-                             : "导入音视频或文字"))
             }
-        }.padding(.horizontal, 26).padding(.vertical, 19)
+        } label: {
+            Label("模型", systemImage: "sparkles").font(.caption)
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+        .help("\(SettingsView.regionName(state.preferences.region)) · \(state.activeModelName)")
     }
 }
 
@@ -505,13 +585,13 @@ struct MarkdownText: View {
 struct RecordingView: View {
     @EnvironmentObject private var state: AppState
     @State private var recorderIsRecording = false
+    @State private var showsMeetingDetails = false
     private var meetingIsActive: Bool {
         state.liveDocumentID != nil || recorderIsRecording || state.isStoppingRecording
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            recordingHeader
+        VStack(alignment: .leading, spacing: 10) {
             if meetingIsActive {
                 activeMeeting
             } else {
@@ -522,34 +602,21 @@ struct RecordingView: View {
                 }
             }
             Divider()
-            recordingActions.layoutPriority(1)
+            if meetingIsActive {
+                meetingFooter.layoutPriority(1)
+            } else {
+                recordingActions.layoutPriority(1)
+            }
         }
-        .padding(24)
+        .padding(.horizontal, meetingIsActive ? 16 : 24)
+        .padding(.top, meetingIsActive ? 10 : 20)
+        .padding(.bottom, meetingIsActive ? 12 : 20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .tint(Palette.actionFill)
         // 不订阅 recorder 的计时/电平更新；只有录音阶段变化影响完整界面。
         .onReceive(state.recorder.$isRecording) { recorderIsRecording = $0 }
-    }
-
-    private var recordingHeader: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "waveform").foregroundStyle(Palette.accent)
-            Text(state.isStoppingRecording ? "正在保存会议" :
-                    (meetingIsActive ? "正在记录会议" : "开始会议录音"))
-                .font(.title2.weight(.semibold))
-            Spacer()
-            if meetingIsActive {
-                RecordingTimerView(recorder: state.recorder)
-            }
-            Button {
-                state.showRecording = false
-                state.workspaceTab = .notes
-            } label: {
-                Label("返回笔记", systemImage: "arrow.left")
-                    .foregroundStyle(.primary)
-            }
-            .buttonStyle(.borderless)
-            .help(meetingIsActive ? "录音继续，可从侧栏返回当前会议。" : "返回笔记列表。")
+        .onChange(of: state.liveDocumentID) { _, _ in
+            showsMeetingDetails = false
         }
     }
 
@@ -591,42 +658,8 @@ struct RecordingView: View {
     }
 
     private var activeMeeting: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    configurationControls
-                    RecordingAudioStatusView(recorder: state.recorder)
-                    if state.isPreparingMeetingRecognition {
-                        VStack(alignment: .leading, spacing: 7) {
-                            HStack(alignment: .top, spacing: 12) {
-                                if state.preferences.usesWhisperRecognition {
-                                    WhisperPreparationStatusView(service: state.mixedSpeech)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                } else {
-                                    Text(state.liveRecognitionStatus)
-                                        .font(.caption).foregroundStyle(.secondary)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                }
-                                Button("取消准备") { state.cancelMeetingRecognitionPreparation() }
-                                    .disabled(state.isStoppingRecording)
-                            }
-                            Text("录音继续保存；模型就绪后识别新声音，准备期间的音频可在会后重新转写。")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    Text(state.liveRecognitionStatus.isEmpty ? "等待识别状态…" : state.liveRecognitionStatus)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(4)
-                        .help(state.liveRecognitionStatus)
-                    if !state.liveRecognitionWarning.isEmpty {
-                        Text(state.liveRecognitionWarning).font(.caption).foregroundStyle(.orange)
-                            .lineSpacing(4).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .frame(maxHeight: state.isPreparingMeetingRecognition ? 230 :
-                    (state.liveRecognitionWarning.isEmpty ? 150 : 200))
+        // 同一个 split 和字幕子树始终保留；展开详情不会重置回看/跟随状态。
+        VSplitView {
             if let document = state.documents.first(where: { $0.id == state.liveDocumentID }) {
                 TranscriptComparisonView(documentID: document.id, segments: document.segments, isLive: true)
                     .id(document.id)
@@ -635,10 +668,133 @@ struct RecordingView: View {
                     .frame(minHeight: 100, maxHeight: .infinity)
             } else {
                 Text("正在准备会议记录…").foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity, minHeight: 100, maxHeight: .infinity)
             }
-            Text(state.liveTranslationStatus.isEmpty ? "录音和文字保存在本机" : state.liveTranslationStatus)
-                .font(.caption).foregroundStyle(.secondary).lineLimit(2).help(state.liveTranslationStatus)
+            meetingDetails
+                .frame(minHeight: showsMeetingDetails ? 80 : 0,
+                       idealHeight: showsMeetingDetails ? 150 : 0,
+                       maxHeight: showsMeetingDetails ? .infinity : 0)
+                .clipped()
+                .allowsHitTesting(showsMeetingDetails)
+                .accessibilityHidden(!showsMeetingDetails)
+        }
+        .frame(maxWidth: .infinity, minHeight: 100, maxHeight: .infinity)
+    }
+
+    private var meetingDetails: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                configurationControls
+                Label("\(SettingsView.regionName(state.preferences.region)) · \(state.activeModelName)",
+                      systemImage: "sparkles")
+                    .font(.caption).foregroundStyle(.secondary)
+                RecordingAudioStatusView(recorder: state.recorder)
+                if state.isPreparingMeetingRecognition {
+                    Text("录音继续保存；模型就绪后识别新声音，准备期间的音频可在会后重新转写。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text(state.liveRecognitionStatus.isEmpty ? "等待识别状态…" : state.liveRecognitionStatus)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                if !state.liveRecognitionWarning.isEmpty {
+                    Text(state.liveRecognitionWarning).font(.caption).foregroundStyle(.orange)
+                        .lineSpacing(4).textSelection(.enabled)
+                }
+                if let error = state.liveTranslationError {
+                    Text(error).font(.caption).foregroundStyle(.orange)
+                        .lineSpacing(4).textSelection(.enabled)
+                }
+                Text(state.liveTranslationStatus.isEmpty ? "录音和文字保存在本机" : state.liveTranslationStatus)
+                    .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 12).padding(.horizontal, 4)
+        }
+    }
+
+    private var meetingFooter: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    meetingLanguagePicker
+                    translationControls
+                    meetingDetailsButton
+                    Spacer(minLength: 0)
+                    recordingButton
+                }
+                HStack(spacing: 10) {
+                    Text("\(meetingLanguageName) → \(state.preferences.targetLanguage)")
+                        .font(.caption).lineLimit(1)
+                        .help("会议语言：\(meetingLanguageName)；翻译为：\(state.preferences.targetLanguage)。完整设置可在详情中查看。")
+                    liveTranslationToggle
+                    meetingDetailsButton
+                    Spacer(minLength: 0)
+                    recordingButton
+                }
+            }
+            HStack(spacing: 12) {
+                RecordingAudioStatusView(recorder: state.recorder, compact: true)
+                Text(state.liveRecognitionStatus.isEmpty ? "等待识别状态…" : state.liveRecognitionStatus)
+                    .lineLimit(1).help(state.liveRecognitionStatus)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(state.liveTranslationStatus.isEmpty ? "文字保存在本机" : state.liveTranslationStatus)
+                    .lineLimit(1).help(state.liveTranslationStatus)
+            }
+            .font(.caption2).foregroundStyle(.secondary)
+            if state.isPreparingMeetingRecognition {
+                HStack(alignment: .top, spacing: 12) {
+                    if state.preferences.usesWhisperRecognition {
+                        WhisperPreparationStatusView(service: state.mixedSpeech)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ProgressView().controlSize(.small)
+                        Text(state.liveRecognitionStatus).font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(2).help(state.liveRecognitionStatus)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    Button("取消准备") { state.cancelMeetingRecognitionPreparation() }
+                        .disabled(state.isStoppingRecording).fixedSize()
+                }
+            }
+            if !state.liveRecognitionWarning.isEmpty {
+                warningSummary(state.liveRecognitionWarning)
+            }
+            if let error = state.liveTranslationError {
+                warningSummary(error)
+            }
+        }
+        .controlSize(.small)
+    }
+
+    private func warningSummary(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+            Text(message.replacingOccurrences(of: "录音继续保存在本机。\n", with: ""))
+                .font(.caption).foregroundStyle(.orange).lineLimit(2).help(message)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("查看详情") { showsMeetingDetails = true }.fixedSize()
+        }
+    }
+
+    private var meetingDetailsButton: some View {
+        Button {
+            showsMeetingDetails.toggle()
+        } label: {
+            Label(showsMeetingDetails ? "收起详情" : "详情",
+                  systemImage: showsMeetingDetails ? "chevron.down" : "chevron.up")
+        }
+        .buttonStyle(.bordered).fixedSize()
+        .help("展开后可上下拖动字幕与详情之间的分隔线，调整两个区域的高度。")
+    }
+
+    private var meetingLanguageName: String {
+        switch state.preferences.speechLocale {
+        case "zh-en": return "中英混合"
+        case "zh-CN": return "普通话"
+        case "en-US": return "English"
+        case "ja-JP": return "日本語"
+        case "ko-KR": return "한국어"
+        default: return state.preferences.speechLocale
         }
     }
 
@@ -678,14 +834,18 @@ struct RecordingView: View {
 
     private var translationControls: some View {
         HStack(spacing: 12) {
-            Toggle("实时翻译", isOn: Binding(
-                get: { state.translateLive },
-                set: { state.setLiveTranslationEnabled($0) }
-            )).toggleStyle(.switch).disabled(state.isStartingRecording || state.isStoppingRecording)
+            liveTranslationToggle
             Picker("翻译为", selection: $state.preferences.targetLanguage) {
                 ForEach(BedrockClient.supportedLanguages, id: \.self) { Text($0).tag($0) }
             }.frame(width: 150).disabled(meetingIsActive || state.isStartingRecording)
         }
+    }
+    private var liveTranslationToggle: some View {
+        Toggle("实时翻译", isOn: Binding(
+            get: { state.translateLive },
+            set: { state.setLiveTranslationEnabled($0) }
+        )).toggleStyle(.switch).disabled(state.isStartingRecording || state.isStoppingRecording)
+            .fixedSize()
     }
 
     private var recordingActions: some View {
@@ -694,19 +854,27 @@ struct RecordingView: View {
                 Text("可以戴耳机，减少麦克风重复收录会议声音。").font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
-            if state.isStartingRecording || state.isStoppingRecording {
+            recordingButton
+        }
+    }
+    @ViewBuilder
+    private var recordingButton: some View {
+        if state.isStartingRecording || state.isStoppingRecording {
+            HStack(spacing: 7) {
                 ProgressView().controlSize(.small)
                 Text(state.isStartingRecording ? "正在开始录音…" : "正在保存…").font(.callout)
-            } else if meetingIsActive {
-                Button { Task { await state.stopMeeting() } } label: {
-                    Label("结束并保存", systemImage: "stop.fill")
-                }.buttonStyle(.borderedProminent).tint(Palette.actionFill).disabled(!recorderIsRecording)
-            } else {
-                Button { Task { await state.startMeeting() } } label: {
-                    Label("开始录音", systemImage: "mic.fill")
-                }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
-                    .disabled(state.isBusy || state.isQuitting)
             }
+            .fixedSize()
+        } else if meetingIsActive {
+            Button { Task { await state.stopMeeting() } } label: {
+                Label("结束并保存", systemImage: "stop.fill")
+            }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
+                .disabled(!recorderIsRecording).fixedSize()
+        } else {
+            Button { Task { await state.startMeeting() } } label: {
+                Label("开始录音", systemImage: "mic.fill")
+            }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
+                .disabled(state.isBusy || state.isQuitting).fixedSize()
         }
     }
 }
@@ -714,6 +882,7 @@ struct RecordingView: View {
 @MainActor
 private struct RecordingAudioStatusView: View {
     @ObservedObject var recorder: MeetingRecorder
+    var compact = false
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -744,11 +913,17 @@ private struct RecordingAudioStatusView: View {
         HStack(spacing: 7) {
             Image(systemName: level > 0.005 ? "waveform" : "speaker.wave.1")
                 .foregroundStyle(level > 0.005 ? Palette.accent : Color.secondary)
-            Text(duration > 0
-                 ? "\(title) · 已收到音频 \(AppState.clock(duration))"
-                 : "\(title) · 等待音频")
-                .monospacedDigit()
-            Text(level > 0.005 ? "当前有声音" : "当前电平较低")
+            if compact {
+                Text(duration > 0
+                     ? "\(title) · \(level > 0.005 ? "有声音" : "已收到音频，电平低")"
+                     : "\(title) · 等待音频")
+            } else {
+                Text(duration > 0
+                     ? "\(title) · 已收到音频 \(AppState.clock(duration))"
+                     : "\(title) · 等待音频")
+                    .monospacedDigit()
+                Text(level > 0.005 ? "当前有声音" : "当前电平较低")
+            }
         }
         .help(duration > 0
               ? "已收到音频数据，是否包含可识别的说话内容以转写结果为准。"

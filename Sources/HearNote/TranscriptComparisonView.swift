@@ -30,25 +30,23 @@ struct TranscriptComparisonView: View {
     var body: some View {
         ScrollViewReader { proxy in
             VStack(spacing: 0) {
-                if isLive {
-                    HStack(spacing: 14) {
+                HStack(spacing: 12) {
+                    Label(isLive ? (followsLatest ? "实时字幕" : "实时字幕 · 正在回看") : "原文与翻译",
+                          systemImage: "text.bubble")
+                        .font(.callout.weight(.semibold)).lineLimit(1)
+                        .help(isLive && !followsLatest ? "正在回看，实时接收和翻译继续。" : "每段原文在上、译文在下。")
+                    Spacer(minLength: 8)
+                    if isLive {
                         Toggle("跟随最新", isOn: $followsLatest).toggleStyle(.checkbox)
                             .help("回看前关闭跟随；录音、识别和翻译会继续。")
-                        if !followsLatest {
-                            Text("正在回看 · 实时接收继续")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
                         Button("回到最新") {
                             followsLatest = true
                             scrollToLatest(proxy)
-                        }.disabled(segments.isEmpty)
-                    }.font(.callout).padding(.horizontal, 20).padding(.vertical, 10)
+                        }.disabled(segments.isEmpty).fixedSize()
+                    }
                 }
-                Label(isLive ? "实时字幕" : "原文与翻译", systemImage: "text.bubble")
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .font(.callout.weight(.semibold))
-                .padding(.horizontal, 20).padding(.vertical, 12)
+                .font(.callout).controlSize(.small)
+                .padding(.horizontal, 16).padding(.vertical, 9)
                 .background(Palette.accent.opacity(0.06))
                 Divider()
                 ScrollView {
