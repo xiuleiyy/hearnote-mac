@@ -26,8 +26,19 @@ public struct AppleSpeechResultMapper {
         let fragments: [TimedText]
     }
 
+    private struct TimeRange {
+        let start: Double
+        let end: Double
+    }
+
     private var pending: [Pending] = []
+    // isFinal 只固定它自己的范围，不能作为此前所有结果的 watermark。
+    private var finalizedRanges: [TimeRange] = []
     private var finalizedThrough = -Double.infinity
+    private var finished = false
+
+    /// 跨已固定范围但没有足够真实时间属性可拆分的非空修订。只计数，不保存正文。
+    public private(set) var unmappableRevisionCount = 0
 
     public init() {}
 
@@ -37,10 +48,67 @@ public struct AppleSpeechResultMapper {
         text: String, start: Double, end: Double, isFinal: Bool,
         resultsFinalizationTime: Double?, source: String?, timedText: [TimedText] = []
     ) -> [Update] {
-        guard start.isFinite, end.isFinite, start >= 0, end >= start else { return [] }
+        guard !finished, start.isFinite, end.isFinite, start >= 0, end >= start else { return [] }
         var updates: [Update] = []
-        // Finalized ranges never change. A stale result must not revive a previous phrase.
-        if start + 0.000_001 >= finalizedThrough {
+        let usable = timedText.filter {
+            $0.start.isFinite && $0.end.isFinite && $0.end >= $0.start
+                && !$0.text.isEmpty && $0.start >= start - 0.000_001
+                && $0.end <= end + 0.000_001
+        }
+        let available = unfinalizedRanges(start: start, end: end)
+        if available.count == 1, let range = available.first,
+           abs(range.start - start) <= 0.000_001, abs(range.end - end) <= 0.000_001 {
+            updates.append(contentsOf: replacePending(
+                text: text, start: start, end: end, isFinal: isFinal,
+                resultsFinalizationTime: resultsFinalizationTime, source: source, timedText: usable
+            ))
+        } else if !available.isEmpty {
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // 撤回不需要推算文字的时间归属；只撤回仍可变化的范围。
+                for range in available {
+                    updates.append(contentsOf: replacePending(
+                        text: "", start: range.start, end: range.end, isFinal: isFinal,
+                        resultsFinalizationTime: resultsFinalizationTime, source: source, timedText: []
+                    ))
+                }
+            } else {
+                var unmappable = usable.isEmpty
+                for range in available {
+                    let fragments = usable.filter {
+                        $0.start >= range.start - 0.000_001 && $0.end <= range.end + 0.000_001
+                    }
+                    if usable.contains(where: {
+                        overlaps($0.start, $0.end, range.start, range.end)
+                            && !fragments.contains($0)
+                    }) {
+                        unmappable = true
+                    }
+                    guard let fragmentStart = fragments.map(\.start).min(),
+                          let fragmentEnd = fragments.map(\.end).max() else { continue }
+                    updates.append(contentsOf: replacePending(
+                        text: fragments.map(\.text).joined(), start: fragmentStart, end: fragmentEnd,
+                        isFinal: isFinal, resultsFinalizationTime: resultsFinalizationTime,
+                        source: source, timedText: fragments
+                    ))
+                }
+                if unmappable, unmappableRevisionCount < Int.max { unmappableRevisionCount += 1 }
+            }
+        }
+        if let time = resultsFinalizationTime, time.isFinite {
+            // Apple 不保证未修改的 volatile 结果会重发 isFinal=true。
+            // 只有模块公布的 watermark 才固定此前的全部范围。
+            updates.append(contentsOf: finalize(through: time))
+        }
+        return updates
+    }
+
+    private mutating func replacePending(
+        text: String, start: Double, end: Double, isFinal: Bool,
+        resultsFinalizationTime: Double?, source: String?, timedText: [TimedText]
+    ) -> [Update] {
+        var updates: [Update] = []
+        // 调用方已移除固定区间；此处只替换仍可修改的音频范围。
+        do {
             let matching = pending.filter { overlaps($0.segment, start: start, end: end) }
             let retained = matching.filter { old in
                 !old.fragments.contains { $0.end <= start + 0.000_001 }
@@ -82,24 +150,14 @@ public struct AppleSpeechResultMapper {
                     updates.append(Update(segment: segment, isFinal: resultIsFinal))
                 }
                 if resultIsFinal {
-                    finalizedThrough = max(finalizedThrough, end)
+                    rememberFinalRange(start: start, end: end)
                 } else {
-                    let usable = timedText.filter {
-                        $0.start.isFinite && $0.end.isFinite && $0.end >= $0.start
-                            && !$0.text.isEmpty && $0.start >= start - 0.000_001
-                            && $0.end <= end + 0.000_001
-                    }
                     pending.append(Pending(
-                        segment: segment, fragments: usable.isEmpty
-                            ? [TimedText(text: text, start: start, end: end)] : usable
+                        segment: segment, fragments: timedText.isEmpty
+                            ? [TimedText(text: text, start: start, end: end)] : timedText
                     ))
                 }
             }
-        }
-        if let time = resultsFinalizationTime, time.isFinite {
-            // Apple 不保证未修改的 volatile 结果会重发 isFinal=true。
-            // 必须同时处理模块公布的 finalization watermark。
-            updates.append(contentsOf: finalize(through: time))
         }
         return updates
     }
@@ -107,11 +165,14 @@ public struct AppleSpeechResultMapper {
     /// 只在 analyzer 成功完成 finalizeAndFinishThroughEndOfInput 后调用。
     /// 取消、失败或超时保留临时文字，不伪装成模型已确认的最终结果。
     public mutating func finishSuccessfully() -> [Update] {
+        guard !finished else { return [] }
         let updates = pending.sorted { $0.segment.start < $1.segment.start }.map {
             Update(segment: $0.segment, isFinal: true)
         }
         if let end = pending.map(\.segment.end).max() { finalizedThrough = max(finalizedThrough, end) }
         pending.removeAll()
+        finalizedRanges.removeAll()
+        finished = true
         return updates
     }
 
@@ -137,7 +198,57 @@ public struct AppleSpeechResultMapper {
         }
         pending = remaining
         finalizedThrough = max(finalizedThrough, time)
+        // 模块 watermark 已保护这些区间，不再逐条保存整场历史。
+        finalizedRanges = finalizedRanges.compactMap {
+            guard $0.end > finalizedThrough + 0.000_001 else { return nil }
+            return TimeRange(start: max($0.start, finalizedThrough), end: $0.end)
+        }
         return updates
+    }
+
+    private mutating func rememberFinalRange(start: Double, end: Double) {
+        guard end > finalizedThrough + 0.000_001 else { return }
+        var merged: [TimeRange] = []
+        for range in (finalizedRanges + [TimeRange(start: start, end: end)])
+            .sorted(by: { $0.start < $1.start }) {
+            if let previous = merged.last, range.start <= previous.end + 0.000_001 {
+                merged[merged.count - 1] = TimeRange(
+                    start: previous.start, end: max(previous.end, range.end)
+                )
+            } else {
+                merged.append(range)
+            }
+        }
+        finalizedRanges = merged
+    }
+
+    private func unfinalizedRanges(start: Double, end: Double) -> [TimeRange] {
+        let lowerBound = max(start, finalizedThrough)
+        guard lowerBound <= end + 0.000_001 else { return [] }
+        if abs(end - start) <= 0.000_001 {
+            guard start + 0.000_001 >= finalizedThrough,
+                  !finalizedRanges.contains(where: {
+                      overlaps(start, end, $0.start, $0.end)
+                  }) else { return [] }
+            return [TimeRange(start: start, end: end)]
+        }
+        var available = [TimeRange(start: lowerBound, end: end)]
+        for locked in finalizedRanges {
+            available = available.flatMap { range -> [TimeRange] in
+                guard overlaps(range.start, range.end, locked.start, locked.end) else {
+                    return [range]
+                }
+                var parts: [TimeRange] = []
+                if range.start < locked.start - 0.000_001 {
+                    parts.append(TimeRange(start: range.start, end: min(range.end, locked.start)))
+                }
+                if range.end > locked.end + 0.000_001 {
+                    parts.append(TimeRange(start: max(range.start, locked.end), end: range.end))
+                }
+                return parts
+            }
+        }
+        return available.filter { $0.end - $0.start > 0.000_001 }
     }
 
     private func preserved(_ fragments: [TimedText], from old: Pending, id: UUID) -> Pending? {
@@ -154,7 +265,12 @@ public struct AppleSpeechResultMapper {
     }
 
     private func overlaps(_ segment: TranscriptSegment, start: Double, end: Double) -> Bool {
-        min(segment.end, end) - max(segment.start, start) > 0.000_001
-            || abs(segment.start - start) <= 0.000_001
+        overlaps(segment.start, segment.end, start, end)
+    }
+
+    private func overlaps(_ start: Double, _ end: Double, _ otherStart: Double,
+                          _ otherEnd: Double) -> Bool {
+        min(end, otherEnd) - max(start, otherStart) > 0.000_001
+            || abs(start - otherStart) <= 0.000_001
     }
 }

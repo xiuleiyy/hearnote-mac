@@ -7,6 +7,15 @@ import Speech
 /// 每个输入源使用独立实例。按约5秒短句更新稳定segment，避免整段45秒才能翻译。
 @MainActor
 final class LiveSpeechRecognizer: ObservableObject {
+    /// 文件端只为新分析器补充起始上下文，旧识别和实时采集保持各自输入策略。
+    var usesSpeechAnalyzer: Bool { analyzerService != nil }
+
+    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double) {
+        analyzerService?.configureFileDiagnostics(
+            prefixDuration: prefixDuration, originalDuration: originalDuration
+        )
+    }
+
     @Published private(set) var isRecognizing = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var recognitionStatus = "已停止" {

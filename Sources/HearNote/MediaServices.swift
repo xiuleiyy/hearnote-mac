@@ -657,6 +657,7 @@ final class SpeechTranscriber: ObservableObject {
             throw MediaServiceError.invalidDuration
         }
         let native = LiveSpeechRecognizer()
+        var fileContext: AppleSpeechFileContext?
         activeNativeRecognition = native
         native.onStatusChange = { [weak self] status in
             guard let self, self.runID == id else { return }
@@ -666,16 +667,55 @@ final class SpeechTranscriber: ObservableObject {
             locale: locale, allowCloudRecognition: false, contextualStrings: contextualStrings,
             source: "录音", onUpdate: { [weak self] segment, _ in
                 guard let self, self.runID == id else { return }
-                if segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.partialSegments.removeAll { $0.id == segment.id }
-                } else if let index = self.partialSegments.firstIndex(where: { $0.id == segment.id }) {
-                    self.partialSegments[index] = segment
+                let mapped: TranscriptSegment
+                if let fileContext {
+                    guard let projected = fileContext.project(segment) else { return }
+                    mapped = projected
                 } else {
-                    self.partialSegments.append(segment)
+                    mapped = segment
+                }
+                if mapped.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.partialSegments.removeAll { $0.id == mapped.id }
+                } else if let index = self.partialSegments.firstIndex(where: { $0.id == mapped.id }) {
+                    self.partialSegments[index] = mapped
+                } else {
+                    self.partialSegments.append(mapped)
                 }
                 self.partialSegments.sort { $0.start < $1.start }
             }
         )
+        try checkRun(id)
+        if native.usesSpeechAnalyzer {
+            guard let context = AppleSpeechFileContext(
+                duration: Double(file.length) / file.processingFormat.sampleRate,
+                sampleRate: file.processingFormat.sampleRate
+            ) else { throw MediaServiceError.invalidDuration }
+            fileContext = context
+            native.configureFileDiagnostics(
+                prefixDuration: context.prefixDuration, originalDuration: context.originalDuration
+            )
+            setStatus("正在转写音频，原文件保留…")
+            var prefixFrame: Int64 = 0
+            while let chunk = context.prefixChunk(at: prefixFrame) {
+                try checkRun(id)
+                guard let silence = AVAudioPCMBuffer(
+                    pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(chunk.frameCount)
+                ) else {
+                    throw MediaServiceError.recognitionFailed("无法分配识别音频缓冲区。")
+                }
+                silence.frameLength = AVAudioFrameCount(chunk.frameCount)
+                let buffers = UnsafeMutableAudioBufferListPointer(silence.mutableAudioBufferList)
+                for index in buffers.indices {
+                    guard let data = buffers[index].mData, buffers[index].mDataByteSize > 0 else {
+                        throw MediaServiceError.recognitionFailed("无法初始化识别音频缓冲区。")
+                    }
+                    memset(data, 0, Int(buffers[index].mDataByteSize))
+                }
+                try await native.appendForTranscription(silence, at: chunk.start)
+                try checkRun(id)
+                prefixFrame += Int64(chunk.frameCount)
+            }
+        }
         // 小块输入按 analyzer 消费速度等待，内存不随录音时长增长。
         while file.framePosition < file.length {
             try checkRun(id)
@@ -685,7 +725,16 @@ final class SpeechTranscriber: ObservableObject {
             }
             try file.read(into: buffer, frameCount: 8192)
             guard buffer.frameLength > 0 else { break }
-            try await native.appendForTranscription(buffer, at: offset)
+            let inputOffset: Double
+            if let fileContext {
+                guard let shifted = fileContext.inputOffset(forOriginalOffset: offset) else {
+                    throw MediaServiceError.invalidDuration
+                }
+                inputOffset = shifted
+            } else {
+                inputOffset = offset
+            }
+            try await native.appendForTranscription(buffer, at: inputOffset)
             try checkRun(id)
             let fedProgress = min(0.99, Double(file.framePosition) / Double(file.length))
             if Int(fedProgress * 100) != Int(progress * 100) {

@@ -14,6 +14,7 @@ protocol AppleSpeechStreamingService: AnyObject {
     ) async throws
     func append(_ buffer: AVAudioPCMBuffer, at offset: Double?)
     func appendForTranscription(_ buffer: AVAudioPCMBuffer, at offset: Double) async throws
+    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double)
     func stop()
     func finish(timeout: TimeInterval) async
     func cancel()
@@ -51,6 +52,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
     private var update: ((TranscriptSegment, Bool) -> Void)?
     private var state: ((String, Bool) -> Void)?
     private var failure: ((Error) -> Void)?
+    private var fileDiagnostics: FileDiagnostics?
 
     func start(
         locale: String, contextualStrings: [String], source: String, origin: Date,
@@ -184,13 +186,28 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         if let currentFailure { throw currentFailure }
         guard let id = runID, acceptingAudio else { throw CancellationError() }
         let converted = try convert(buffer)
-        guard converted.frameLength > 0 else { return }
+        guard converted.frameLength > 0 else {
+            fileDiagnostics?.recordInput(
+                sourceFrames: Int(buffer.frameLength), sourceRate: buffer.format.sampleRate,
+                convertedFrames: 0, convertedRate: converted.format.sampleRate,
+                requestedStart: offset, inputEnd: timeline.end ?? 0, enqueued: false
+            )
+            return
+        }
         let deadline = Date().addingTimeInterval(20)
         while true {
             try checkRun(id)
             if let currentFailure { throw currentFailure }
             guard acceptingAudio else { throw CancellationError() }
-            if enqueue(converted, at: offset) { return }
+            if enqueue(converted, at: offset) {
+                fileDiagnostics?.recordInput(
+                    sourceFrames: Int(buffer.frameLength), sourceRate: buffer.format.sampleRate,
+                    convertedFrames: Int(converted.frameLength),
+                    convertedRate: converted.format.sampleRate, requestedStart: offset,
+                    inputEnd: timeline.end ?? 0
+                )
+                return
+            }
             guard Date() < deadline else {
                 let error = AppleAnalyzerError.inputBacklog
                 fail(error, id: id)
@@ -198,6 +215,15 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
             }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
+    }
+
+    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double) {
+        guard let id = runID, acceptingAudio,
+              prefixDuration.isFinite, prefixDuration >= 0,
+              originalDuration.isFinite, originalDuration > 0 else { return }
+        fileDiagnostics = FileDiagnostics(
+            id: id, prefixDuration: prefixDuration, originalDuration: originalDuration
+        )
     }
 
     func stop() {
@@ -214,6 +240,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         }
         let timeout = requestedTimeout.isFinite ? min(300, max(1, requestedTimeout)) : 20
         acceptingAudio = false
+        fileDiagnostics?.logInputFinished()
         continuation.finish()
         inputContinuation = nil
         setState("正在收尾…", ready: false)
@@ -282,6 +309,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         update = nil
         state = nil
         failure = nil
+        fileDiagnostics = nil
         resumeFinishWaiters()
     }
 
@@ -515,11 +543,64 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         let start = range.start.seconds
         let end = CMTimeRangeGetEnd(range).seconds
         let fragments = timedFragments(text, fallback: range)
-        for result in mapper.receive(
+        let updates = mapper.receive(
             text: String(text.characters), start: start, end: end, isFinal: isFinal,
             resultsFinalizationTime: finalizationTime.seconds, source: source, timedText: fragments
-        ) {
+        )
+        fileDiagnostics?.recordResult(
+            characters: text.characters.count, start: start, end: end,
+            isFinal: isFinal, watermark: finalizationTime.seconds,
+            fragmentCount: fragments.count, updates: updates,
+            unmappableRevisions: mapper.unmappableRevisionCount
+        )
+        for result in updates {
             update?(result.segment, result.isFinal)
+        }
+    }
+
+    /// 仅文件转写启用。记录范围和数量以区分输入／原生结果／映射问题，
+    /// 不记录正文、文件路径、文档 ID、认证信息或音频。
+    @MainActor
+    private final class FileDiagnostics {
+        private let run: String
+        private let logger = Logger(subsystem: "app.hearnote.mac", category: "AppleSpeechFile")
+        private var inputs = 0
+        private var results = 0
+        private var sourceSeconds = 0.0
+        private var convertedSeconds = 0.0
+
+        init(id: UUID, prefixDuration: Double, originalDuration: Double) {
+            run = id.uuidString
+            logger.info("run=\(self.run, privacy: .public) event=begin prefixSeconds=\(prefixDuration, privacy: .public) originalSeconds=\(originalDuration, privacy: .public)")
+        }
+
+        func recordInput(sourceFrames: Int, sourceRate: Double, convertedFrames: Int,
+                         convertedRate: Double, requestedStart: Double, inputEnd: Double,
+                         enqueued: Bool = true) {
+            inputs += 1
+            sourceSeconds += Double(sourceFrames) / sourceRate
+            convertedSeconds += Double(convertedFrames) / convertedRate
+            guard inputs <= 8 else { return }
+            logger.info("run=\(self.run, privacy: .public) event=input sequence=\(self.inputs, privacy: .public) sourceFrames=\(sourceFrames, privacy: .public) sourceRate=\(sourceRate, privacy: .public) convertedFrames=\(convertedFrames, privacy: .public) convertedRate=\(convertedRate, privacy: .public) requestedStart=\(requestedStart, privacy: .public) inputEnd=\(inputEnd, privacy: .public) enqueued=\(enqueued, privacy: .public)")
+        }
+
+        func logInputFinished() {
+            logger.info("run=\(self.run, privacy: .public) event=inputFinished buffers=\(self.inputs, privacy: .public) sourceSeconds=\(self.sourceSeconds, privacy: .public) convertedSeconds=\(self.convertedSeconds, privacy: .public)")
+        }
+
+        func recordResult(characters: Int, start: Double, end: Double, isFinal: Bool,
+                          watermark: Double, fragmentCount: Int,
+                          updates: [AppleSpeechResultMapper.Update], unmappableRevisions: Int) {
+            results += 1
+            guard results <= 64 else { return }
+            let updatedCharacters = updates.reduce(0) { $0 + $1.segment.text.count }
+            let retractions = updates.filter {
+                $0.segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }.count
+            let safeStart = start.isFinite ? start : -1
+            let safeEnd = end.isFinite ? end : -1
+            let safeWatermark = watermark.isFinite ? watermark : -1
+            logger.info("run=\(self.run, privacy: .public) event=result sequence=\(self.results, privacy: .public) characters=\(characters, privacy: .public) start=\(safeStart, privacy: .public) end=\(safeEnd, privacy: .public) isFinal=\(isFinal, privacy: .public) watermark=\(safeWatermark, privacy: .public) fragments=\(fragmentCount, privacy: .public) updates=\(updates.count, privacy: .public) updatedCharacters=\(updatedCharacters, privacy: .public) retractions=\(retractions, privacy: .public) unmappableRevisions=\(unmappableRevisions, privacy: .public)")
         }
     }
 
