@@ -22,6 +22,20 @@ MARKER_RE = re.compile(
 TAG_RE = re.compile(r"mac-[0-9]{8}-[0-9]+-[0-9a-f]{8}")
 ASSETS = ("HearNote-Mac-arm64.dmg", "HearNote-Mac-arm64.app.zip",
           "SHA256SUMS", "Installation.md")
+GATEKEEPER_OPENING_GUIDE = (
+    "## 首次被 macOS 拦截时\n\n"
+    f"以下步骤仅适用于从[本仓库 GitHub Releases](https://github.com/{REPOSITORY}/releases)"
+    "下载的听译。\n\n"
+    "当前安装包使用 ad-hoc 签名，未做 Developer ID 签名或 Apple 公证。"
+    "如果看到 `Apple could not verify ...` 或“Apple 无法验证”，请按以下步骤打开：\n\n"
+    "1. 点击“完成 / Done”，保留 App。\n\n"
+    "2. 打开“系统设置 → 隐私与安全性”，向下找到听译的提示，"
+    "点击“仍要打开 / Open Anyway”。\n\n"
+    "3. 按提示输入 Mac 登录密码或使用 Touch ID，再确认“打开 / Open”。\n\n"
+    "若没有“仍要打开”按钮，先从“应用程序”重新尝试启动听译，再返回“隐私与安全性”。"
+    "完成授权后，这次安装通常可以直接双击打开。\n\n"
+    "无需关闭系统整体保护。[Apple 官方说明](https://support.apple.com/zh-cn/102445)。\n\n"
+)
 
 
 class ReleaseError(RuntimeError):
@@ -176,13 +190,13 @@ def prepare_assets(args, destination: Path) -> list[Path]:
         "支持 Apple Silicon（M 系列）Mac，macOS 14 及以上。使用安装包无需 Xcode。\n\n"
         "公开 GitHub Releases 的安装包可以直接从浏览器下载，无需登录 GitHub。\n\n"
         "1. 下载并双击 `HearNote-Mac-arm64.dmg`，将听译.app 拖到“应用程序”，再从那里打开。\n"
-        "2. 当前为 ad-hoc 签名，未做 Developer ID 签名或 Apple 公证。若系统拦截，"
-        "在“系统设置 → 隐私与安全性 → 仍要打开”中授权，不需要关闭系统整体保护。\n"
+        "2. 若首次被系统拦截，请按下方“首次被 macOS 拦截时”的步骤授权。\n"
         "3. 翻译与摘要需配置自己的 Bedrock API Key；Key 保存在本机 Keychain。"
         "也可以暂时跳过配置，仅使用录音与本地转写。\n"
         "4. 按录音来源授予麦克风／系统录制权限；首次使用 Whisper 需下载或导入本地模型，"
         "之后复用缓存。\n\n"
-        f"源码提交：`{args.commit}`。\n\n"
+        + GATEKEEPER_OPENING_GUIDE
+        + f"源码提交：`{args.commit}`。\n\n"
         "自动构建验证不代表真实会议识别准确度、外放双讲或北京网络延迟已经验收。\n",
         encoding="utf-8",
     )
@@ -281,11 +295,11 @@ def publish(args, github: GitHub) -> bool:
                 "- 支持 Apple Silicon（M 系列）、macOS 14+；使用无需 Xcode。\n"
                 "- Mac CI 完成 Core 测试、release 编译、音频处理器合成检查、"
                 "签名／架构、独立启动、图标及 DMG 挂载验证。\n"
-                "- 当前为 ad-hoc 签名，未做 Developer ID 签名或 Apple 公证；"
-                "首次可能需要在“隐私与安全性”中选择“仍要打开”。\n"
+                "- 首次启动可能被 macOS 拦截，处理步骤见下方说明。\n"
                 "- 首次需准备语音识别模型、按来源授予录音权限；翻译和摘要需自己的 Bedrock API Key。\n"
                 "- 实际会议准确度、外放双讲、GUI 与北京网络延迟仍需本机验收。\n\n"
-                f"源码：`{args.commit}`。\n\n"
+                + GATEKEEPER_OPENING_GUIDE
+                + f"源码：`{args.commit}`。\n\n"
                 f"[构建验证记录](https://github.com/{args.repo}/actions/runs/{args.run_id}) · "
                 f"[完整安装说明](https://github.com/{args.repo}/blob/{args.commit}/docs/安装使用.md)\n",
                 encoding="utf-8",

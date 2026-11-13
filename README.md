@@ -10,7 +10,23 @@
 
 打开 [最新版下载](https://github.com/xiuleiyy/hearnote-mac/releases/latest)，在 Assets 下载 `HearNote-Mac-arm64.dmg`。仓库为 public，同事使用浏览器下载 Release 无需 GitHub 账号。
 
-支持 Apple Silicon Mac、macOS 14+；双击 DMG，将“听译”拖到 Applications 后启动，不需要 Xcode。当前未做 Developer ID 签名或 Apple 公证，首次可能需在系统“隐私与安全性”中允许打开。首次使用配置自己的 Bedrock API Key、授予录音权限并准备语音模型，详见安装说明。
+支持 Apple Silicon Mac、macOS 14+；双击 DMG，将“听译”拖到 Applications 后启动，不需要 Xcode。首次使用配置自己的 Bedrock API Key、授予录音权限并准备语音模型，详见安装说明。
+
+### 首次打开被 macOS 拦截
+
+当前安装包采用 ad-hoc 签名，尚未做 Developer ID 签名或 Apple 公证。首次可能显示 **“听译” Not Opened**、**Apple could not verify…** 或“Apple 无法验证”。
+
+确认 App 来自上面的 GitHub Releases 后，按以下步骤打开：
+
+1. 在提示中点击 **Done（完成）**，保留 App。
+
+2. 打开 **系统设置 → 隐私与安全性**，向下找到“听译”被阻止的提示，点击 **仍要打开（Open Anyway）**。
+
+3. 验证密码或 Touch ID，再点击 **打开（Open）**。
+
+若没有“仍要打开”，重新尝试启动听译，再返回此设置页。授权后，这次安装通常可直接双击打开。完整说明见 [首次打开被拦截](docs/安装使用.md#首次打开被-macos-拦截)；步骤依据 [Apple 官方说明](https://support.apple.com/zh-cn/102445)。
+
+### 更新与发布
 
 每次 `main` 更新通过 Mac 构建与检查后，自动发布最新 Release。新安装包上传并回下载校验成功后才更新 Latest，保留最近三个由此流程发布的版本，Git tag 保留。源码、构建日志和修复 diff 继续存放在 Actions artifact。
 
