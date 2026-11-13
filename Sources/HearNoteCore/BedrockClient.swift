@@ -3,6 +3,17 @@ import Foundation
 import FoundationNetworking
 #endif
 
+/// Only validated metadata is retained; server messages and headers are never stored.
+public struct BedrockThrottling: Equatable, Sendable {
+    public enum Reason: Equatable, Sendable {
+        case tokenLimit, rateLimit
+    }
+
+    public let reason: Reason
+    public let requestID: String?
+    public let retryAfter: TimeInterval?
+}
+
 public enum BedrockError: LocalizedError, Equatable {
     case invalidConfiguration
     case invalidAPIKey
@@ -15,6 +26,7 @@ public enum BedrockError: LocalizedError, Equatable {
     case untranslatedInput
     case contentFiltered
     case unexpectedStop(String)
+    case throttled(BedrockThrottling)
     case httpFailure(Int)
 
     public var errorDescription: String? {
@@ -41,6 +53,13 @@ public enum BedrockError: LocalizedError, Equatable {
             return "Bedrock 内容过滤或 Guardrail 中止了输出。本次结果未保存。"
         case .unexpectedStop(let reason):
             return "Bedrock 未正常完成文字生成（\(reason)）。本次结果未保存。"
+        case .throttled(let details):
+            let explanation = details.reason == .tokenLimit
+                ? "服务端提示 token 使用量受限，但未说明具体配额周期或容量原因。"
+                : "服务端限制了当前请求，具体额度或容量原因尚未确定。"
+            let requestID = details.requestID.map { "\n请求 ID：\($0)" } ?? ""
+            return "Bedrock 返回 HTTP 429：\(explanation)请稍后重试，或选择其他模型／Region，"
+                + "并核对 Bedrock 额度。本次未保存结果。\(requestID)"
         case .httpFailure(let status):
             switch status {
             case 400: return "Bedrock 拒绝请求。请核对 Region、模型 ID、模型访问方式和输入长度。"
@@ -73,7 +92,9 @@ public struct BedrockClient {
     }
     private var isSonnet55: Bool { modelName == "global.anthropic.claude-sonnet-5-5" }
     private var isGLM53: Bool { ["zai.glm-5.3", "global.zai.glm-5.3"].contains(modelName) }
-    private var usesGPTResponses: Bool { modelName == "global.openai.gpt-5.6-sol" }
+    private var usesGPTResponses: Bool {
+        ["global.openai.gpt-5.6-sol", "global.openai.gpt-6-luna"].contains(modelName)
+    }
     private var usesKimiChat: Bool {
         return [
             "moonshotai.kimi-k3", "global.moonshotai.kimi-k3",
@@ -421,12 +442,60 @@ public struct BedrockClient {
         try Task.checkCancellation()
         guard let httpResponse = response as? HTTPURLResponse else { throw BedrockError.invalidResponse }
         guard (200...299).contains(httpResponse.statusCode) else {
-            // Do not surface the raw server body: it may contain request details.
-            throw BedrockError.httpFailure(httpResponse.statusCode)
+            throw Self.httpFailure(response: httpResponse, data: data)
         }
         if usesKimiChat { return try Self.chatOutput(from: data) }
         if usesGPTResponses { return try Self.responsesOutput(from: data) }
         return try Self.converseOutput(from: data)
+    }
+
+    private static func httpFailure(response: HTTPURLResponse, data: Data) -> BedrockError {
+        guard response.statusCode == 429 else { return .httpFailure(response.statusCode) }
+        // Parse only a small error object. Never retain or surface arbitrary service text,
+        // URLs, credentials, or the namespace suffix of x-amzn-errortype.
+        let body = data.count <= 16_384
+            ? (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] : nil
+        let fields = (body?["error"] as? [String: Any]) ?? body
+        let code = fields?["code"] as? String
+        let type = (fields?["type"] as? String) ?? (fields?["__type"] as? String)
+        let headerType = response.value(forHTTPHeaderField: "x-amzn-errortype")?
+            .prefix(64).split(separator: ":", maxSplits: 1).first.map(String.init)
+        let knownThrottle = ["rate_limit_exceeded", "ThrottlingException"].contains(code ?? "")
+            || ["rate_limit_error", "ThrottlingException"].contains(type ?? "")
+            || headerType == "ThrottlingException"
+        let message = (fields?["message"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let tokenLimit = [
+            "too many tokens, please wait before trying again.",
+            "too many tokens, please wait before trying again"
+        ].contains(message ?? "")
+        guard knownThrottle || tokenLimit else { return .httpFailure(429) }
+        let requestID = validatedRequestID(
+            response.value(forHTTPHeaderField: "x-amzn-requestid")
+                ?? response.value(forHTTPHeaderField: "x-request-id")
+        )
+        let retryAfter = validatedRetryAfter(response.value(forHTTPHeaderField: "Retry-After"))
+        return .throttled(.init(
+            reason: tokenLimit ? .tokenLimit : .rateLimit,
+            requestID: requestID, retryAfter: retryAfter
+        ))
+    }
+
+    private static func validatedRequestID(_ value: String?) -> String? {
+        guard let value, value.count == 36,
+              value.range(
+                of: #"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"#,
+                options: .regularExpression
+              ) != nil else { return nil }
+        return value
+    }
+
+    private static func validatedRetryAfter(_ value: String?) -> TimeInterval? {
+        guard let value, value.count <= 32,
+              value.unicodeScalars.allSatisfy({ (0x30...0x39).contains($0.value) || $0.value == 0x2E }),
+              value.range(of: #"^[0-9]+(?:\.[0-9]+)?$"#, options: .regularExpression) != nil,
+              let seconds = TimeInterval(value), seconds.isFinite, seconds >= 0 else { return nil }
+        return seconds
     }
 
     private static func converseOutput(from data: Data) throws -> String {

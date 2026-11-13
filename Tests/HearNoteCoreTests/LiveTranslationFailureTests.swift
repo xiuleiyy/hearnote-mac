@@ -131,6 +131,31 @@ final class LiveTranslationFailureTests: XCTestCase {
         XCTAssertEqual(queue.next(now: origin.addingTimeInterval(5)), second)
     }
 
+    func testTypedTokenLimitUsesTheExistingGlobalCooldownAndBoundedRetryPolicy() {
+        let error = BedrockError.throttled(.init(
+            reason: .tokenLimit, requestID: nil, retryAfter: 30
+        ))
+        let first = TranscriptSegment(start: 0, text: "Please continue.")
+        let second = TranscriptSegment(start: 1, text: "请继续。")
+        var queue = LiveTranslationQueue()
+        queue.update(first, isFinal: true, now: origin)
+        queue.update(second, isFinal: true, now: origin)
+        let firstFailure = queue.recordFailure(error, for: first, now: origin)
+        XCTAssertEqual(firstFailure?.category, .rateLimited)
+        XCTAssertEqual(firstFailure?.recovery, .retry(after: 5))
+        XCTAssertFalse(queue.isSuspended)
+        XCTAssertNil(queue.next(now: origin.addingTimeInterval(4.9), flush: true))
+        XCTAssertEqual(queue.next(now: origin.addingTimeInterval(5)), first)
+        let lastAttempt = origin.addingTimeInterval(5)
+        XCTAssertEqual(queue.recordFailure(error, for: first, now: lastAttempt)?.recovery, .retryManually)
+        XCTAssertNil(queue.next(now: origin.addingTimeInterval(9.9), flush: true))
+        XCTAssertEqual(queue.next(now: origin.addingTimeInterval(10)), second)
+        XCTAssertEqual(LiveTranslationFailurePolicy.failure(
+            for: BedrockError.throttled(.init(reason: .rateLimit, requestID: nil, retryAfter: nil)),
+            attempts: 1
+        ).category, .rateLimited)
+    }
+
     func testNetworkContentAndLanguageFailuresHaveSeparateBoundedPolicies() async {
         TranslationFailureProtocol.handler = { _ in throw URLError(.networkConnectionLost) }
         do {

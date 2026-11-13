@@ -52,7 +52,7 @@
 | 独立翻译 | 文字、语音、两人轮流对话、语言交换、朗读、复制、历史和收藏 |
 | 图片翻译 | 导入图片／截图，在本机识别文字；校对后翻译 |
 
-默认选用 Claude Sonnet 5.5，另有 Kimi K3（Kimi 3）、GLM 5.3、GPT 5.6 Sol 作为对比候选。
+默认选用 Claude Sonnet 5.5，另有 Kimi K3（Kimi 3）、GLM 5.3、GPT 5.6 Sol、GPT 6 Luna 作为对比候选。
 
 | 预置型号 | 完整 Bedrock model ID |
 |---|---|
@@ -60,12 +60,15 @@
 | Kimi K3 | `global.moonshotai.kimi-k3` |
 | GLM 5.3 | `global.zai.glm-5.3` |
 | GPT 5.6 Sol | `global.openai.gpt-5.6-sol` |
+| GPT 6 Luna | `global.openai.gpt-6-luna` |
 
 当前预置包含 GLM 5.3。GLM 5.2 的可调用 Bedrock ID 尚未核实，未将其预置；取得可验证的 ID 后可在设置中添加。
 
-旧版本已保存的内置 Sonnet／Qwen 配置会升级；上一版内置 Kimi K3.1 会换成 K3，保留选中状态、Region 和其他自定义型号。迁移有版本门禁，用户已删除的候选不会每次重新添加。当前 API Key 是否可用仍以连接测试为准；官方 GLM 卡注明仅符合条件的客户可访问。连接测试真实调用所选模型并显示总耗时。默认展示东京 Region，也可选择其他 Region。这四个型号在东京使用 Global profile；东京是入口，实际推理位置可能在其他 Region，厂商国别也不等于数据所在地区。
+旧版本已保存的内置 Sonnet／Qwen 配置会升级；旧内置 Kimi K3.1 会换成 K3。此次升级只补入 GPT 6 Luna，保留当前选中型号、Region 和其他自定义配置；之后删除 Luna 不会每次重新添加。当前 API Key 是否可用仍以连接测试为准；官方 GLM 卡注明仅符合条件的客户可访问。连接测试真实调用所选模型并显示总耗时。五个型号均采用支持东京（`ap-northeast-1`）和美国东部（`us-east-1`）入口的 Global profile；入口不限定实际推理所在地区，厂商国别也不等于数据所在地区。
 
 App 自动按型号适配：Sonnet 使用 Converse 的 `between_tools` 与低 effort；Kimi 使用 Bedrock Chat Completions、关闭推理；GLM 使用 Converse、低 effort，无法关闭推理；GPT 使用 Bedrock Responses、关闭推理。均使用同一个用户 Bedrock API Key，无需其他厂商 Key。用户自行添加的其他型号沿用文本 Converse。
+
+服务端明确返回 token 限流时，App 显示对应中文说明和经过校验的 Request ID，不回显原始服务端正文。HTTP 429 本身不能区分分钟额度、每日额度和模型容量，不能只靠换 Region 或反复点击认定已经解决。详见 [模型选择与限流排查](docs/Bedrock模型与限流.md)。
 
 ## 在 Mac 上构建
 
@@ -194,6 +197,8 @@ docs/                     安装与 Mac 实机验收
 - GLM 5.3 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5-3.html
 
 - GPT 5.6 Sol 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-sol.html
+
+- GPT 6 Luna 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-6-luna.html
 
 - Z.AI 官方型号目录：https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards-zai.html
 

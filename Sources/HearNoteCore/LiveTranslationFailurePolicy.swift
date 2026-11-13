@@ -38,7 +38,7 @@ public enum LiveTranslationFailurePolicy {
                 category = .configuration; pause = true; delay = nil
             case .httpFailure(300...399):
                 category = .configuration; pause = true; delay = nil
-            case .httpFailure(429):
+            case .httpFailure(429), .throttled:
                 category = .rateLimited; pause = false; delay = 5
             case .httpFailure(408), .httpFailure(504):
                 category = .service; pause = false; delay = 2

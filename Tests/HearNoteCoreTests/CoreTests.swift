@@ -143,6 +143,7 @@ final class BedrockClientTests: XCTestCase {
 
     override func tearDown() {
         MockProtocol.handler = nil
+        MockProtocol.headers = [:]
     }
 
     func testRequestUsesExactAWSHostEncodedModelAndBearer() throws {
@@ -367,16 +368,192 @@ final class BedrockClientTests: XCTestCase {
                 "type": "function_call", "name": "unrequested_tool", "arguments": "secret-server-value"
             ]]), .unexpectedStop("tool_use"))
         ]
-        for (response, expectedError) in cases {
-            MockProtocol.handler = { _ in (200, response) }
-            do {
-                _ = try await client(modelID: "global.openai.gpt-5.6-sol").testConnection()
-                XCTFail("Responses must not accept incomplete, refused or non-text output.")
-            } catch {
-                XCTAssertEqual(error as? BedrockError, expectedError)
-                XCTAssertFalse(error.localizedDescription.contains("secret-server-value"))
+        for modelID in ["global.openai.gpt-5.6-sol", "global.openai.gpt-6-luna"] {
+            for (response, expectedError) in cases {
+                MockProtocol.handler = { _ in (200, response) }
+                do {
+                    _ = try await client(modelID: modelID).testConnection()
+                    XCTFail("Responses must not accept incomplete, refused or non-text output.")
+                } catch {
+                    XCTAssertEqual(error as? BedrockError, expectedError)
+                    XCTAssertFalse(error.localizedDescription.contains("secret-server-value"))
+                }
             }
         }
+    }
+
+    func testGPT6LunaUsesResponsesAndPreservesOpaqueProfileIDs() async throws {
+        for modelID in [
+            "global.openai.gpt-6-luna",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/global.openai.gpt-6-luna"
+        ] {
+            MockProtocol.handler = { request in
+                XCTAssertEqual(request.url?.host, "bedrock-runtime.us-east-1.amazonaws.com")
+                XCTAssertEqual(request.url?.path, "/openai/v1/responses")
+                let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                    with: MockRequestBody.data(from: request)
+                ) as? [String: Any])
+                XCTAssertEqual(body["model"] as? String, modelID)
+                XCTAssertEqual((body["reasoning"] as? [String: String])?["effort"], "none")
+                XCTAssertEqual(body["store"] as? Bool, false)
+                XCTAssertEqual(body["stream"] as? Bool, false)
+                XCTAssertGreaterThanOrEqual(try XCTUnwrap(body["max_output_tokens"] as? Int), 256)
+                return (200, Self.responsesResponse(output: [
+                    ["type": "reasoning", "summary": [["type": "summary_text", "text": "private-reasoning"]]],
+                    Self.outputMessage("OK")
+                ]))
+            }
+            let output = try await client(modelID: modelID).testConnection()
+            XCTAssertEqual(output, "OK")
+        }
+        for unknownID in ["openai.gpt-6-luna", "global.openai.gpt-6-luna.1", "global.openai.gpt-6-unknown"] {
+            let request = try client(modelID: unknownID).makeRequest(system: "", text: "", maxTokens: 32)
+            XCTAssertTrue(request.url!.absoluteString.hasSuffix("/converse"))
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: MockRequestBody.data(from: request)
+            ) as? [String: Any])
+            XCTAssertNil(body["reasoning"])
+            XCTAssertNotNil(body["inferenceConfig"])
+        }
+    }
+
+    func testTokenLimit429RetainsOnlyValidatedMetadataAcrossKimiAndGLM() async throws {
+        let requestID = "ab123456-7890-1234-5678-90abcdef1234"
+        let secret = "synthetic-private-key-never-used-on-network"
+        let internalURL = "http://internal.example.invalid/private-route"
+        let cases: [(String, [String: Any], [String: String])] = [
+            ("global.moonshotai.kimi-k3", [
+                "error": ["message": "Too many tokens, please wait before trying again.",
+                          "type": "rate_limit_error", "code": "rate_limit_exceeded"],
+                "request": ["authorization": secret, "private_url": internalURL]
+            ], ["x-request-id": requestID, "Retry-After": "12.5"]),
+            ("global.zai.glm-5.3", [
+                "message": "Too many tokens, please wait before trying again.",
+                "authorization": secret
+            ], ["x-amzn-errortype": "ThrottlingException:\(internalURL)",
+                "x-amzn-requestid": requestID, "Retry-After": "12.5"])
+        ]
+        for (modelID, body, headers) in cases {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            MockProtocol.headers = headers
+            MockProtocol.handler = { _ in (429, data) }
+            do {
+                _ = try await client(modelID: modelID).testConnection()
+                XCTFail("The actual token-limit response must fail.")
+            } catch {
+                XCTAssertEqual(error as? BedrockError, .throttled(.init(
+                    reason: .tokenLimit, requestID: requestID, retryAfter: 12.5
+                )))
+                XCTAssertTrue(error.localizedDescription.contains("token 使用量受限"))
+                XCTAssertTrue(error.localizedDescription.contains("未说明具体配额周期或容量原因"))
+                XCTAssertTrue(error.localizedDescription.contains(requestID))
+                let diagnostic = error.localizedDescription + String(describing: error)
+                for forbidden in [secret, internalURL, "Too many tokens", "ThrottlingException:"] {
+                    XCTAssertFalse(diagnostic.contains(forbidden))
+                }
+            }
+        }
+    }
+
+    func testKnown429NeverEchoesItsArbitraryMessageOrInvalidHeaderMetadata() async throws {
+        let secret = "synthetic-private-key"
+        let data = try JSONSerialization.data(withJSONObject: [
+            "error": ["type": "rate_limit_error", "code": "rate_limit_exceeded",
+                      "message": "Bearer \(secret); private source transcript"]
+        ])
+        let invalid: [(String, String)] = [
+            ("Bearer \(secret)", "NaN"),
+            ("http://internal.example.invalid/\(secret)", "Infinity"),
+            ("abc123", "-1"),
+            ("12345678-1234-1234-1234-123456789012\n", "Fri, 13 Nov 2026 00:00:00 GMT"),
+            (String(repeating: "a", count: 300), "1e309"),
+            ("12345678-1234-1234-1234-12345678901中", "12\n"),
+            ("", String(repeating: "9", count: 100))
+        ]
+        for (requestID, retryAfter) in invalid {
+            MockProtocol.headers = ["x-amzn-requestid": requestID, "Retry-After": retryAfter]
+            MockProtocol.handler = { _ in (429, data) }
+            do {
+                _ = try await client().testConnection()
+                XCTFail("A known throttling response must fail.")
+            } catch {
+                XCTAssertEqual(error as? BedrockError, .throttled(.init(
+                    reason: .rateLimit, requestID: nil, retryAfter: nil
+                )))
+                let diagnostic = error.localizedDescription + String(describing: error)
+                XCTAssertFalse(diagnostic.contains(secret))
+                XCTAssertFalse(diagnostic.contains("private source transcript"))
+                XCTAssertFalse(diagnostic.contains("internal.example"))
+            }
+        }
+    }
+
+    func testUnknown429OversizedBodiesAndOtherStatusesPreserveHTTPFailureSemantics() async throws {
+        let secret = "synthetic-secret-never-returned"
+        let knownData = try JSONSerialization.data(withJSONObject: [
+            "message": "Too many tokens, please wait before trying again."
+        ])
+        let unknownData = try JSONSerialization.data(withJSONObject: [
+            "error": ["type": secret, "code": secret, "message": "Too many requests: \(secret)"]
+        ])
+        let cases: [(Int, Data)] = [
+            (429, unknownData), (429, Data("invalid-json \(secret)".utf8)),
+            (429, Data(repeating: 97, count: 16_385)),
+            (400, knownData), (401, knownData), (403, knownData), (503, knownData)
+        ]
+        MockProtocol.headers = ["x-amzn-errortype": "ThrottlingExceptionUnknown",
+                                "x-amzn-requestid": secret, "Retry-After": "5"]
+        for (status, data) in cases {
+            MockProtocol.handler = { _ in (status, data) }
+            do {
+                _ = try await client().testConnection()
+                XCTFail("An HTTP failure must not become generated text.")
+            } catch {
+                XCTAssertEqual(error as? BedrockError, .httpFailure(status))
+                XCTAssertFalse((error.localizedDescription + String(describing: error)).contains(secret))
+            }
+        }
+    }
+
+    func test429RequiresAKnownTypeOrTheExactTokenLimitPhrase() async {
+        let cases: [(Data, [String: String], BedrockThrottling.Reason)] = [
+            (Data(), ["x-amzn-errortype": "ThrottlingException:http://internal.example.invalid"], .rateLimit),
+            (Data(repeating: 97, count: 16_385), ["x-amzn-errortype": "ThrottlingException"], .rateLimit),
+            (Data(#"{"message":"Too many tokens, please wait before trying again."}"#.utf8), [:], .tokenLimit)
+        ]
+        for (data, headers, reason) in cases {
+            MockProtocol.headers = headers
+            MockProtocol.handler = { _ in (429, data) }
+            do {
+                _ = try await client().testConnection()
+                XCTFail("A known throttle or explicit token-limit response must fail.")
+            } catch {
+                XCTAssertEqual(error as? BedrockError, .throttled(.init(
+                    reason: reason, requestID: nil, retryAfter: nil
+                )))
+                XCTAssertFalse((error.localizedDescription + String(describing: error)).contains("internal.example"))
+            }
+        }
+    }
+
+    func testCancellationDiscardsALateTokenLimitResponseForGPT6Luna() async {
+        let started = expectation(description: "Luna request started")
+        let release = DispatchSemaphore(value: 0)
+        MockProtocol.handler = { _ in
+            started.fulfill()
+            _ = release.wait(timeout: .now() + 2)
+            return (429, Data(#"{"message":"Too many tokens, please wait before trying again."}"#.utf8))
+        }
+        let task = Task { try await client(modelID: "global.openai.gpt-6-luna").testConnection() }
+        await fulfillment(of: [started], timeout: 2)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Cancellation must discard even a late server error.")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        release.signal()
     }
 
     func testInvalidRegionCannotExfiltrateCredential() {
@@ -1024,6 +1201,7 @@ private final class FailingBodyStream: InputStream {
 
 private final class MockProtocol: URLProtocol {
     static var handler: ((URLRequest) throws -> (Int, Data))?
+    static var headers: [String: String] = [:]
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -1039,7 +1217,7 @@ private final class MockProtocol: URLProtocol {
                 url: request.url!,
                 statusCode: status,
                 httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Type": "application/json"]
+                headerFields: ["Content-Type": "application/json"].merging(Self.headers) { _, value in value }
             )!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)

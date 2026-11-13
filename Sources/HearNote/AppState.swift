@@ -29,13 +29,16 @@ struct AppPreferences: Codable {
     static let gptModel = SavedModel(
         name: "GPT 5.6 Sol", modelID: "global.openai.gpt-5.6-sol"
     )
+    static let gptLunaModel = SavedModel(
+        name: "GPT 6 Luna", modelID: "global.openai.gpt-6-luna"
+    )
     var region = "ap-northeast-1"
     // 固定已核实的最新 Sonnet 版本；当前 key 权限仍以连接测试为准。
     var modelID = Self.defaultModel.modelID
     var models: [SavedModel] = [
-        Self.defaultModel, Self.kimiModel, Self.glmModel, Self.gptModel
+        Self.defaultModel, Self.kimiModel, Self.glmModel, Self.gptModel, Self.gptLunaModel
     ]
-    private var modelPresetVersion = 2
+    private var modelPresetVersion = 3
     private var meetingDefaultsVersion = 1
     var speechLocale = "en-US"
     var speechEngine = SpeechRecognitionEngine.whisper
@@ -74,10 +77,11 @@ struct AppPreferences: Codable {
         }
     }
     private mutating func migrateModelPresets() {
-        guard modelPresetVersion < 2 else { return }
-        var replacements: [String: SavedModel] = [
-            "global.moonshotai.kimi-k3.1": Self.kimiModel
-        ]
+        guard modelPresetVersion < 3 else { return }
+        var replacements: [String: SavedModel] = [:]
+        if modelPresetVersion < 2 {
+            replacements["global.moonshotai.kimi-k3.1"] = Self.kimiModel
+        }
         if modelPresetVersion < 1 {
             replacements["global.anthropic.claude-sonnet-4-6"] = Self.defaultModel
             replacements["qwen.qwen3-235b-a22b-2507-v1:0"] = Self.kimiModel
@@ -104,8 +108,11 @@ struct AppPreferences: Codable {
                 }
             }
         }
+        if !upgraded.contains(where: { $0.modelID == Self.gptLunaModel.modelID }) {
+            upgraded.append(Self.gptLunaModel)
+        }
         models = upgraded
-        modelPresetVersion = 2
+        modelPresetVersion = 3
     }
     var configuration: BedrockConfiguration {
         BedrockConfiguration(region: region, modelID: modelID)
