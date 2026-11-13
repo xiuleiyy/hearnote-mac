@@ -317,6 +317,128 @@ final class BedrockClientTests: XCTestCase {
         XCTAssertEqual(result, "OK")
     }
 
+    func testGLM5AndKimi25UseConverseWithTheirOwnThinkingSwitchAndPreserveOpaqueIDs() throws {
+        for modelID in [
+            "zai.glm-5", "moonshotai.kimi-k2.5",
+            "arn:aws:bedrock:us-east-1::foundation-model/zai.glm-5",
+            "arn:aws:bedrock:us-east-1::foundation-model/moonshotai.kimi-k2.5"
+        ] {
+            let request = try client(modelID: modelID).makeRequest(
+                system: "system instruction", text: "source text", maxTokens: 32
+            )
+            XCTAssertEqual(request.url?.host, "bedrock-runtime.us-east-1.amazonaws.com")
+            XCTAssertTrue(request.url!.absoluteString.hasSuffix("/converse"))
+            let encodedPath = URLComponents(
+                url: request.url!, resolvingAgainstBaseURL: false
+            )?.percentEncodedPath
+            var allowed = CharacterSet.alphanumerics
+            allowed.insert(charactersIn: "-._~")
+            let encodedModel = try XCTUnwrap(modelID.addingPercentEncoding(withAllowedCharacters: allowed))
+            XCTAssertEqual(encodedPath, "/model/\(encodedModel)/converse")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"),
+                           "Bearer test-key-never-used-on-network")
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: MockRequestBody.data(from: request)
+            ) as? [String: Any])
+            let fields = try XCTUnwrap(body["additionalModelRequestFields"] as? [String: Any])
+            XCTAssertEqual((fields["thinking"] as? [String: String])?["type"], "disabled")
+            XCTAssertNil(fields["reasoning_effort"])
+            XCTAssertNil(fields["output_config"])
+            XCTAssertNil(fields["extra_body"])
+            XCTAssertNil(body["extra_body"])
+            let inference = try XCTUnwrap(body["inferenceConfig"] as? [String: Any])
+            XCTAssertEqual(inference["maxTokens"] as? Int, 32)
+            let texts = try Self.requestTexts(request)
+            XCTAssertEqual(texts.system, "system instruction")
+            XCTAssertEqual(texts.text, "source text")
+        }
+        for unknownID in [
+            "global.zai.glm-5", "us.zai.glm-5", "global.moonshotai.kimi-k2.5",
+            "moonshotai.kimi-k2.50", "zai.glm-50"
+        ] {
+            let request = try client(modelID: unknownID).makeRequest(
+                system: "", text: "", maxTokens: 32
+            )
+            XCTAssertTrue(request.url!.absoluteString.hasSuffix("/converse"))
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: MockRequestBody.data(from: request)
+            ) as? [String: Any])
+            XCTAssertNil(body["additionalModelRequestFields"])
+        }
+    }
+
+    func testGLM5AndKimi25PreserveFinalTextAndRejectIncompleteOrReasoningOnlyOutputs() async throws {
+        let successful = try JSONSerialization.data(withJSONObject: [
+            "output": ["message": ["role": "assistant", "content": [
+                ["reasoningContent": ["reasoningText": ["text": "private reasoning"]]],
+                ["text": "OK"]
+            ]]],
+            "stopReason": "end_turn"
+        ])
+        let reasoningOnly = try JSONSerialization.data(withJSONObject: [
+            "output": ["message": ["role": "assistant", "content": [
+                ["reasoningContent": ["reasoningText": ["text": "private reasoning"]]]
+            ]]],
+            "stopReason": "end_turn"
+        ])
+        for modelID in ["zai.glm-5", "moonshotai.kimi-k2.5"] {
+            MockProtocol.handler = { request in
+                XCTAssertTrue(request.url!.absoluteString.hasSuffix("/converse"))
+                return (200, successful)
+            }
+            let result = try await client(modelID: modelID).testConnection()
+            XCTAssertEqual(result, "OK")
+            let failures: [(Data, BedrockError)] = [
+                (Self.response(text: "partial", stopReason: "max_tokens"), .outputTruncated),
+                (Self.response(text: "partial", stopReason: "guardrail_intervened"), .contentFiltered),
+                (reasoningOnly, .invalidResponse),
+                (Self.response(text: "partial", stopReason: "private-server-reason"), .unexpectedStop("unknown"))
+            ]
+            for (data, expected) in failures {
+                MockProtocol.handler = { _ in (200, data) }
+                do {
+                    _ = try await client(modelID: modelID).testConnection()
+                    XCTFail("Incomplete, filtered or reasoning-only output must not be accepted.")
+                } catch {
+                    XCTAssertEqual(error as? BedrockError, expected)
+                    XCTAssertFalse(error.localizedDescription.contains("private-server-reason"))
+                    XCTAssertFalse(error.localizedDescription.contains("private reasoning"))
+                }
+            }
+        }
+    }
+
+    func testGLM5AndKimi25DiscardLateSuccessAndThrottlingAfterCancellation() async {
+        let lateResponses: [(Int, Data)] = [
+            (200, Self.response(text: "late answer", stopReason: "end_turn")),
+            (429, Data(#"{"message":"Too many tokens, please wait before trying again."}"#.utf8))
+        ]
+        for modelID in ["zai.glm-5", "moonshotai.kimi-k2.5"] {
+            for (status, data) in lateResponses {
+                let started = expectation(description: "\(modelID) request started")
+                let release = DispatchSemaphore(value: 0)
+                MockProtocol.handler = { _ in
+                    started.fulfill()
+                    _ = release.wait(timeout: .now() + 2)
+                    return (status, data)
+                }
+                let nativeClient = client(modelID: modelID)
+                let task = Task { try await nativeClient.testConnection() }
+                await fulfillment(of: [started], timeout: 2)
+                let cancelledAt = Date()
+                task.cancel()
+                do {
+                    _ = try await task.value
+                    XCTFail("Cancellation must discard a late answer or throttling response.")
+                } catch {
+                    XCTAssertTrue(error is CancellationError)
+                }
+                XCTAssertLessThan(Date().timeIntervalSince(cancelledAt), 1)
+                release.signal()
+            }
+        }
+    }
+
     func testGPTResponsesKeepsBedrockAuthAndReadsFinalTextAfterReasoning() async throws {
         let expected = "[00:00] The budget is 300 yuan, not 3,000 yuan."
         MockProtocol.handler = { request in
@@ -428,6 +550,16 @@ final class BedrockClientTests: XCTestCase {
                 "request": ["authorization": secret, "private_url": internalURL]
             ], ["x-request-id": requestID, "Retry-After": "12.5"]),
             ("global.zai.glm-5.3", [
+                "message": "Too many tokens, please wait before trying again.",
+                "authorization": secret
+            ], ["x-amzn-errortype": "ThrottlingException:\(internalURL)",
+                "x-amzn-requestid": requestID, "Retry-After": "12.5"]),
+            ("moonshotai.kimi-k2.5", [
+                "message": "Too many tokens, please wait before trying again.",
+                "authorization": secret
+            ], ["x-amzn-errortype": "ThrottlingException:\(internalURL)",
+                "x-amzn-requestid": requestID, "Retry-After": "12.5"]),
+            ("zai.glm-5", [
                 "message": "Too many tokens, please wait before trying again.",
                 "authorization": secret
             ], ["x-amzn-errortype": "ThrottlingException:\(internalURL)",
@@ -652,6 +784,8 @@ final class BedrockClientTests: XCTestCase {
         let expected = "Li Ming has not approved the 300-yuan budget.\nThe release date is not decided."
         let cases: [(String?, String, Data)] = [
             (nil, "/converse", Self.response(text: expected, stopReason: "end_turn")),
+            ("moonshotai.kimi-k2.5", "/converse", Self.response(text: expected, stopReason: "end_turn")),
+            ("zai.glm-5", "/converse", Self.response(text: expected, stopReason: "end_turn")),
             ("global.moonshotai.kimi-k3", "/openai/v1/chat/completions",
              Self.kimiResponse(text: expected, finishReason: "stop", reasoning: "不展示推理")),
             ("global.openai.gpt-5.6-sol", "/openai/v1/responses",
@@ -917,6 +1051,94 @@ final class BedrockClientTests: XCTestCase {
             XCTAssertEqual(error as? BedrockError, .untranslatedInput)
         }
         XCTAssertEqual(calls, 1)
+    }
+
+    func testKimiMixedTranslationRejectsTheActualChineseCopyHiddenBehindALanguageLabel() async {
+        let firstSource = "The VPC endpoint is optional; do not enable it yet. We need 30B parameters, not 4B."
+        let secondSource = "Zoom 会议下午 2:30 开始，不能录入 API Key；东京还是美东还没决定。"
+        let returned = """
+        [00:00] VPC endpoint is optional; do not enable it yet. We need 30B parameters, not 4B.
+
+        [00:05] 英文：The Zoom meeting starts at 2:30 PM; API Key cannot be entered; whether it's Tokyo or US East has not been decided yet.
+        中文：Zoom 会议下午 2:30 开始，不能录入 API Key；东京还是美东还没决定。
+        """
+        var calls = 0
+        MockProtocol.handler = { request in
+            calls += 1
+            let texts = try Self.requestTexts(request)
+            XCTAssertTrue(texts.text.contains(firstSource))
+            XCTAssertTrue(texts.text.contains(secondSource))
+            return (200, Self.response(text: returned, stopReason: "end_turn"))
+        }
+        do {
+            _ = try await client(modelID: "moonshotai.kimi-k2.5").translate(
+                segments: [
+                    TranscriptSegment(start: 0, end: 4, text: firstSource),
+                    TranscriptSegment(start: 5, end: 10, text: secondSource)
+                ],
+                targetLanguage: BedrockClient.bilingualLanguage
+            )
+            XCTFail("A language label must not conceal a substantial unchanged Chinese source line.")
+        } catch {
+            XCTAssertEqual(error as? BedrockError, .untranslatedInput)
+        }
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testBilingualCopyCheckNormalizesKnownLabelsOnSourceAndOutput() async {
+        let chinese = "Zoom 会议下午 2:30 开始，不能录入 API Key；东京还是美东还没决定。"
+        let english = "The VPC endpoint is optional; do not enable it yet."
+        let cases = [
+            ("", "英文："), ("", "中文："), ("", "English: "),
+            ("", "cHiNeSe : "), ("", "TRANSLATION："), ("", "译文："),
+            ("Chinese: ", "Translation: "), ("译文：", "")
+        ]
+        for (sourceLabel, outputLabel) in cases {
+            MockProtocol.handler = { _ in
+                (200, Self.response(
+                    text: "[00:00] VPC endpoint is optional; do not enable it yet.\n"
+                        + "[00:05] 〔会议声音〕 \(outputLabel)\(chinese)",
+                    stopReason: "end_turn"
+                ))
+            }
+            do {
+                _ = try await client().translate(
+                    segments: [
+                        TranscriptSegment(text: english),
+                        TranscriptSegment(start: 5, end: 10, text: sourceLabel + chinese)
+                    ],
+                    targetLanguage: BedrockClient.bilingualLanguage
+                )
+                XCTFail("Known labels must not bypass exact source-copy validation.")
+            } catch {
+                XCTAssertEqual(error as? BedrockError, .untranslatedInput)
+            }
+        }
+    }
+
+    func testBilingualCopyCheckKeepsLabeledTermsAndTranslatedMixedText() async throws {
+        let terms = "[00:00] English: API Key Bedrock\n[00:01] 译文：URLSession.data(for:)"
+        MockProtocol.handler = { _ in (200, Self.response(text: terms, stopReason: "end_turn")) }
+        let termResult = try await client().translate(
+            segments: [
+                TranscriptSegment(text: "API Key Bedrock"),
+                TranscriptSegment(start: 1, end: 2, text: "URLSession.data(for:)")
+            ],
+            targetLanguage: BedrockClient.bilingualLanguage
+        )
+        XCTAssertEqual(termResult, terms)
+
+        let source = "Zoom 会议还没确定 release date；the budget is 300 yuan，不能写成 3000。"
+        let translated = """
+        [01:05] English: The Zoom meeting has not decided the release date; the budget is 300 yuan, not 3000.
+        Chinese: Zoom 会议还没确定发布日期；预算是 300 元，不能写成 3000。
+        """
+        MockProtocol.handler = { _ in (200, Self.response(text: translated, stopReason: "end_turn")) }
+        let mixedResult = try await client(modelID: "moonshotai.kimi-k2.5").translate(
+            segments: [TranscriptSegment(start: 65, end: 70, text: source)],
+            targetLanguage: BedrockClient.bilingualLanguage
+        )
+        XCTAssertEqual(mixedResult, translated)
     }
 
     func testUntranslatedCheckAllowsShortTermsAndAnExplicitSameLanguageTarget() async throws {

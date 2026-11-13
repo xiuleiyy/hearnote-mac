@@ -52,21 +52,21 @@
 | 独立翻译 | 文字、语音、两人轮流对话、语言交换、朗读、复制、历史和收藏 |
 | 图片翻译 | 导入图片／截图，在本机识别文字；校对后翻译 |
 
-默认选用 Claude Sonnet 5.5，另有 Kimi K3（Kimi 3）、GLM 5.3、GPT 5.6 Sol、GPT 6 Luna 作为对比候选。
+默认选用 Claude Sonnet 5.5，另有 Kimi K2.5、GLM 5、GPT 5.6 Sol、GPT 6 Luna 作为对比候选。
 
 | 预置型号 | 完整 Bedrock model ID |
 |---|---|
 | Claude Sonnet 5.5，默认 | `global.anthropic.claude-sonnet-5-5` |
-| Kimi K3 | `global.moonshotai.kimi-k3` |
-| GLM 5.3 | `global.zai.glm-5.3` |
+| Kimi K2.5 | `moonshotai.kimi-k2.5` |
+| GLM 5 | `zai.glm-5` |
 | GPT 5.6 Sol | `global.openai.gpt-5.6-sol` |
 | GPT 6 Luna | `global.openai.gpt-6-luna` |
 
-当前预置包含 GLM 5.3。GLM 5.2 的可调用 Bedrock ID 尚未核实，未将其预置；取得可验证的 ID 后可在设置中添加。
+Kimi K2.5 和 GLM 5 使用区域内模型 ID，东京（`ap-northeast-1`）和美国东部（`us-east-1`）均为官方支持的入口。这两个版本不支持 Global／Geo profile，不添加 `global.`、`us.` 等前缀。App 通过 Converse 请求 `thinking.type=disabled`；请用实际译文和耗时判断效果，不把这一参数当成准确率保证。
 
-旧版本已保存的内置 Sonnet／Qwen 配置会升级；旧内置 Kimi K3.1 会换成 K3。此次升级只补入 GPT 6 Luna，保留当前选中型号、Region 和其他自定义配置；之后删除 Luna 不会每次重新添加。当前 API Key 是否可用仍以连接测试为准；官方 GLM 卡注明仅符合条件的客户可访问。连接测试真实调用所选模型并显示总耗时。五个型号均采用支持东京（`ap-northeast-1`）和美国东部（`us-east-1`）入口的 Global profile；入口不限定实际推理所在地区，厂商国别也不等于数据所在地区。
+此次升级把旧内置 Kimi K3／K3.1 换为 K2.5，GLM 5.3 换为 GLM 5；若原来选中其中之一，也切到同厂商的新预置。Region、其他自定义型号和语音设置保留；之后删除的新预置不会每次重新添加，也不会把此前已删除的 Luna 补回。旧版本原有的 Sonnet／Qwen 迁移继续保留。当前 API Key 是否可用仍以连接测试为准。连接测试真实调用所选模型并显示总耗时。Sonnet 和两款 GPT 仍使用支持东京和美东入口的 Global profile，入口不限定实际推理所在地区。
 
-App 自动按型号适配：Sonnet 使用 Converse 的 `between_tools` 与低 effort；Kimi 使用 Bedrock Chat Completions、关闭推理；GLM 使用 Converse、低 effort，无法关闭推理；GPT 使用 Bedrock Responses、关闭推理。均使用同一个用户 Bedrock API Key，无需其他厂商 Key。用户自行添加的其他型号沿用文本 Converse。
+App 自动按型号适配：Sonnet 使用 Converse 的 `between_tools` 与低 effort；Kimi K2.5／GLM 5 使用 Converse 请求关闭 thinking；GPT 使用 Bedrock Responses、关闭推理。均使用同一个用户 Bedrock API Key，无需其他厂商 Key。旧自定义 Kimi K3／K3.1 保留 Chat Completions，GLM 5.3 保留低 effort；其他自行添加的型号沿用文本 Converse。
 
 服务端明确返回 token 限流时，App 显示对应中文说明和经过校验的 Request ID，不回显原始服务端正文。HTTP 429 本身不能区分分钟额度、每日额度和模型容量，不能只靠换 Region 或反复点击认定已经解决。详见 [模型选择与限流排查](docs/Bedrock模型与限流.md)。
 
@@ -192,9 +192,9 @@ docs/                     安装与 Mac 实机验收
 
 - Sonnet 5.5 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5-5.html
 
-- Kimi K3 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k3.html
+- Kimi K2.5 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k2-5.html
 
-- GLM 5.3 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5-3.html
+- GLM 5 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-zai-glm-5.html
 
 - GPT 5.6 Sol 模型卡：https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-sol.html
 

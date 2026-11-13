@@ -21,10 +21,10 @@ struct AppPreferences: Codable {
         name: "Claude Sonnet 5.5", modelID: "global.anthropic.claude-sonnet-5-5"
     )
     static let kimiModel = SavedModel(
-        name: "Kimi K3", modelID: "global.moonshotai.kimi-k3"
+        name: "Kimi K2.5", modelID: "moonshotai.kimi-k2.5"
     )
     static let glmModel = SavedModel(
-        name: "GLM 5.3", modelID: "global.zai.glm-5.3"
+        name: "GLM 5", modelID: "zai.glm-5"
     )
     static let gptModel = SavedModel(
         name: "GPT 5.6 Sol", modelID: "global.openai.gpt-5.6-sol"
@@ -38,7 +38,7 @@ struct AppPreferences: Codable {
     var models: [SavedModel] = [
         Self.defaultModel, Self.kimiModel, Self.glmModel, Self.gptModel, Self.gptLunaModel
     ]
-    private var modelPresetVersion = 3
+    private var modelPresetVersion = 4
     private var meetingDefaultsVersion = 1
     var speechLocale = "en-US"
     var speechEngine = SpeechRecognitionEngine.whisper
@@ -77,12 +77,14 @@ struct AppPreferences: Codable {
         }
     }
     private mutating func migrateModelPresets() {
-        guard modelPresetVersion < 3 else { return }
-        var replacements: [String: SavedModel] = [:]
-        if modelPresetVersion < 2 {
-            replacements["global.moonshotai.kimi-k3.1"] = Self.kimiModel
-        }
-        if modelPresetVersion < 1 {
+        guard modelPresetVersion < 4 else { return }
+        let previousVersion = modelPresetVersion
+        var replacements: [String: SavedModel] = [
+            "global.moonshotai.kimi-k3": Self.kimiModel,
+            "global.moonshotai.kimi-k3.1": Self.kimiModel,
+            "global.zai.glm-5.3": Self.glmModel
+        ]
+        if previousVersion < 1 {
             replacements["global.anthropic.claude-sonnet-4-6"] = Self.defaultModel
             replacements["qwen.qwen3-235b-a22b-2507-v1:0"] = Self.kimiModel
             replacements["qwen.qwen3-next-80b-a3b"] = Self.kimiModel
@@ -101,18 +103,19 @@ struct AppPreferences: Codable {
                 upgraded.append(replacement)
             }
         }
-        if modelPresetVersion < 1 {
+        if previousVersion < 1 {
             for candidate in [Self.glmModel, Self.gptModel] {
                 if !upgraded.contains(where: { $0.modelID == candidate.modelID }) {
                     upgraded.append(candidate)
                 }
             }
         }
-        if !upgraded.contains(where: { $0.modelID == Self.gptLunaModel.modelID }) {
+        if previousVersion < 3,
+           !upgraded.contains(where: { $0.modelID == Self.gptLunaModel.modelID }) {
             upgraded.append(Self.gptLunaModel)
         }
         models = upgraded
-        modelPresetVersion = 3
+        modelPresetVersion = 4
     }
     var configuration: BedrockConfiguration {
         BedrockConfiguration(region: region, modelID: modelID)

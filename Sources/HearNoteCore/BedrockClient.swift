@@ -92,6 +92,9 @@ public struct BedrockClient {
     }
     private var isSonnet55: Bool { modelName == "global.anthropic.claude-sonnet-5-5" }
     private var isGLM53: Bool { ["zai.glm-5.3", "global.zai.glm-5.3"].contains(modelName) }
+    private var usesDisabledThinking: Bool {
+        ["zai.glm-5", "moonshotai.kimi-k2.5"].contains(modelName)
+    }
     private var usesGPTResponses: Bool {
         ["global.openai.gpt-5.6-sol", "global.openai.gpt-6-luna"].contains(modelName)
     }
@@ -109,6 +112,10 @@ public struct BedrockClient {
             return .init(thinking: .init(type: "between_tools"), output_config: .init(effort: "low"))
         }
         if isGLM53 { return .init(reasoning_effort: "low") }
+        if usesDisabledThinking {
+            // GLM 5／K2.5 使用 thinking 开关，不能套用旧型号的 reasoning_effort。
+            return .init(thinking: .init(type: "disabled"))
+        }
         return nil
     }
     private static let defaultSession = secureSession()
@@ -316,12 +323,7 @@ public struct BedrockClient {
         let latin = Self.latinCharacters.numberOfMatches(in: normalized, range: sourceRange)
         let ordinaryEnglishWords = Self.englishSemanticWordCount(normalized)
         let translatedText = output.split(whereSeparator: \.isNewline)
-            .map {
-                Self.normalizedTranslationLine(String($0)).replacingOccurrences(
-                    of: #"^(?:英文|中文|English|Chinese|Translation|译文)\s*[:：]\s*"#,
-                    with: "", options: [.regularExpression, .caseInsensitive]
-                )
-            }
+            .map { Self.normalizedTranslationLine(String($0)) }
             .joined(separator: " ")
         let outputRange = NSRange(translatedText.startIndex..<translatedText.endIndex, in: translatedText)
         let outputHan = Self.hanCharacters.numberOfMatches(in: translatedText, range: outputRange)
@@ -362,6 +364,9 @@ public struct BedrockClient {
         line.replacingOccurrences(
             of: #"^\s*(?:\[\d{2}:\d{2}(?::\d{2})?\]\s*)?(?:〔[^〕]*〕\s*)?"#,
             with: "", options: .regularExpression
+        ).replacingOccurrences(
+            of: #"^(?:英文|中文|English|Chinese|Translation|译文)\s*[:：]\s*"#,
+            with: "", options: [.regularExpression, .caseInsensitive]
         ).split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
@@ -420,7 +425,7 @@ public struct BedrockClient {
             request.httpBody = try JSONEncoder().encode(ConverseRequest(
                 messages: [Message(role: "user", content: [TextContent(text: text)])],
                 system: [TextContent(text: system)],
-                // GLM 不能关闭推理；给短连接测试留出低推理和最终文字的预算。
+                // GLM 5.3 不能关闭推理；给旧自定义型号的短连接测试留出正文预算。
                 inferenceConfig: InferenceConfiguration(maxTokens: isGLM53 ? max(1024, maxTokens) : maxTokens),
                 additionalModelRequestFields: additionalModelFields
             ))
