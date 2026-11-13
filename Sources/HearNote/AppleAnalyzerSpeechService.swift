@@ -21,6 +21,7 @@ protocol AppleSpeechStreamingService: AnyObject {
 
 #if compiler(>=6.2)
 import CoreMedia
+import OSLog
 
 /// SpeechAnalyzer 自行管理本机识别，不请求旧 SFSpeechRecognizer/Siri 的授权。
 /// 模型安装仍需网络；录音由调用方独立保存，准备期间不积压整场 PCM。
@@ -69,21 +70,26 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         timeline = AppleSpeechInputTimeline()
         inputBudget = AppleSpeechInputBudget()
         setState("正在检查本机语言支持…", ready: false)
+        let preparation = PreparationDiagnostics(id: id)
         do {
             let module = try await makeModule(locale: Locale(identifier: locale))
             try checkRun(id)
             backendDescription = module.description
             let modules: [any SpeechModule] = [module.module]
-            try await ensureAssets(modules: modules, id: id)
-            try checkRun(id)
-            // Apple 文档要求先安装模块资产，才能查询正确的 compatible audio format。
-            guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules) else {
-                throw AppleAnalyzerError.audioFormatUnavailable
-            }
-            try checkRun(id)
-            audioFormat = format
+            // 尽早归属本次会话，取消准备时可以结束这个 analyzer，不影响另一路。
             let analyzer = SpeechAnalyzer(modules: modules)
             self.analyzer = analyzer
+            try await prepareAssets(module: module, analyzer: analyzer,
+                                    diagnostics: preparation, id: id)
+            try checkRun(id)
+            // 资产状态只用于诊断；格式与真实准备结果决定能否开始输入。
+            preparation.enter(.choosingAudioFormat)
+            let availableFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules)
+            try checkRun(id)
+            guard let format = availableFormat else {
+                throw AppleAnalyzerError.audioFormatUnavailable
+            }
+            audioFormat = format
             if !contextualStrings.isEmpty {
                 let context = AnalysisContext()
                 context.contextualStrings[.general] = Array(contextualStrings.prefix(100))
@@ -91,6 +97,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
                 try checkRun(id)
             }
             setState("正在准备本机识别模型…", ready: false)
+            preparation.enter(.preparingAudioFormat)
             try await analyzer.prepareToAnalyze(in: format)
             try checkRun(id)
             let (stream, continuation) = AsyncStream<QueuedInput>.makeStream()
@@ -125,20 +132,37 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
                     }
                 }
             }
+            preparation.enter(.startingAnalyzer)
             try await analyzer.start(inputSequence: BudgetedInputSequence(
                 stream: stream, budget: inputBudget
             ))
             try checkRun(id)
             acceptingAudio = true
+            preparation.logReady()
             setState("等待音频", ready: true)
         } catch {
+            let wasCancelled = error is CancellationError || Task.isCancelled || runID != id
+            let reportedError: Error
+            if wasCancelled {
+                reportedError = CancellationError()
+            } else {
+                let diagnostic = AppleSpeechPreparationFailure(
+                    stage: preparation.stage, underlyingError: error
+                )
+                preparation.logFailure(diagnostic)
+                if error as? AppleSpeechAssetPreparationError == .unsupportedAssets {
+                    reportedError = AppleAnalyzerError.assetsUnsupported
+                } else if error is AppleAnalyzerError {
+                    reportedError = error
+                } else {
+                    reportedError = diagnostic
+                }
+            }
             if runID == id {
-                let wasCancelled = error is CancellationError || Task.isCancelled
                 cancel()
                 onState(wasCancelled ? "已停止" : "\(backendDescription) · 识别未就绪", false)
             }
-            if Task.isCancelled { throw CancellationError() }
-            throw error
+            throw reportedError
         }
     }
 
@@ -278,6 +302,22 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
             case .dictation: return "Apple DictationTranscriber（本机）"
             }
         }
+
+        func hasInstalledLocale() async -> Bool {
+            let installed: [Locale]
+            let selected: [Locale]
+            switch self {
+            case .speech(let value):
+                installed = await Speech.SpeechTranscriber.installedLocales
+                selected = value.selectedLocales
+            case .dictation(let value):
+                installed = await DictationTranscriber.installedLocales
+                selected = value.selectedLocales
+            }
+            return !selected.isEmpty && selected.allSatisfy {
+                AppleSpeechAssetPreparation.matchesInstalledLocale(requested: $0, installed: installed)
+            }
+        }
     }
 
     private func makeModule(locale: Locale) async throws -> Module {
@@ -297,21 +337,33 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         throw AppleAnalyzerError.localeUnsupported(locale.identifier)
     }
 
-    private func ensureAssets(modules: [any SpeechModule], id: UUID) async throws {
-        let status = await AssetInventory.status(forModules: modules)
-        try checkRun(id)
-        guard status != .unsupported else {
-            throw AppleAnalyzerError.assetsUnsupported
-        }
-        if status == .installed { return }
-        setState(status == .downloading ? "正在等待本机模型安装…" : "正在请求本机模型资源…",
-                 ready: false)
-        do {
-            // 此调用按需 reserve 语言；不要 stop 时 release，以免两源或其他会话互相卸载。
-            if let request = try await AssetInventory.assetInstallationRequest(supporting: modules) {
-                try checkRun(id)
+    private func prepareAssets(module: Module, analyzer: SpeechAnalyzer,
+                               diagnostics: PreparationDiagnostics, id: UUID) async throws {
+        let modules: [any SpeechModule] = [module.module]
+        try await AppleSpeechAssetPreparation.prepare(
+            status: {
+                switch await AssetInventory.status(forModules: modules) {
+                case .unsupported: return .unsupported
+                case .downloading: return .downloading
+                case .supported: return .supported
+                case .installed: return .installed
+                @unknown default: return .unsupported
+                }
+            },
+            hasInstalledLocale: { await module.hasInstalledLocale() },
+            install: {
+                // 按需 reserve 语言；不要 stop 时 release，以免两源或其他会话互相卸载。
+                self.setState("正在请求本机模型资源…", ready: false)
+                let request = try await AssetInventory.assetInstallationRequest(supporting: modules)
+                try self.checkRun(id)
+                guard let request else {
+                    diagnostics.record(.init(stage: .requestingInstallation,
+                                             installationRequested: false))
+                    return false
+                }
+                diagnostics.record(.init(stage: .installingAssets, installationRequested: true))
                 let progress = request.progress
-                progressTask = Task { [weak self] in
+                self.progressTask = Task { [weak self] in
                     while !Task.isCancelled {
                         guard let self, self.runID == id else { return }
                         let fraction = progress.fractionCompleted
@@ -326,20 +378,73 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
                     }
                 }
                 defer {
-                    if runID == id {
-                        progressTask?.cancel()
-                        progressTask = nil
+                    if self.runID == id {
+                        self.progressTask?.cancel()
+                        self.progressTask = nil
                     }
                 }
                 try await request.downloadAndInstall()
-                try checkRun(id)
+                try self.checkRun(id)
+                return true
+            },
+            prepare: {
+                self.setState("正在加载本机识别资源…", ready: false)
+                // 在 App 自身进程、同一个 analyzer 内验证；CLI 的加载结果不能替代它。
+                try await analyzer.prepareToAnalyze(in: nil)
+                try self.checkRun(id)
+            },
+            checkCancellation: { try self.checkRun(id) },
+            onEvent: { event in
+                diagnostics.record(event)
+                if event.stage == .preparingExistingAssets {
+                    self.setState("正在加载已有本机模型…", ready: false)
+                }
             }
-            guard await AssetInventory.status(forModules: modules) == .installed else {
-                throw AppleAnalyzerError.assetsNotInstalled
-            }
-        } catch {
-            if error is CancellationError || Task.isCancelled { throw CancellationError() }
-            throw AppleAnalyzerError.assetInstallationFailed(error.localizedDescription)
+        )
+    }
+
+    /// 只记录受控的状态和系统错误码，不记录原文、Key、NSError.userInfo 或文件路径。
+    private final class PreparationDiagnostics {
+        var stage: AppleSpeechPreparationStage = .checkingAssets
+        private let id: UUID
+        private var initialStatus: AppleSpeechAssetStatus?
+        private var observedStatus: AppleSpeechAssetStatus?
+        private var installationRequested: Bool?
+        private var hasInstalledLocale: Bool?
+        private let logger = Logger(subsystem: "app.hearnote.mac", category: "AppleSpeechPreparation")
+
+        init(id: UUID) { self.id = id }
+
+        func enter(_ stage: AppleSpeechPreparationStage) {
+            record(.init(stage: stage))
+        }
+
+        func record(_ event: AppleSpeechAssetPreparation.Event) {
+            stage = event.stage
+            if let value = event.initialStatus { initialStatus = value }
+            if let value = event.observedStatus { observedStatus = value }
+            if let value = event.installationRequested { installationRequested = value }
+            if let value = event.hasInstalledLocale { hasInstalledLocale = value }
+            let detail = summary
+            logger.info("\(detail, privacy: .public)")
+        }
+
+        func logFailure(_ error: AppleSpeechPreparationFailure) {
+            let detail = "\(summary) failure=\(error.diagnosticSummary)"
+            logger.error("\(detail, privacy: .public)")
+        }
+
+        func logReady() {
+            let detail = "\(summary) outcome=ready"
+            logger.notice("\(detail, privacy: .public)")
+        }
+
+        private var summary: String {
+            "run=\(id.uuidString) stage=\(stage.rawValue)"
+                + " initial=\(initialStatus?.rawValue ?? "unqueried")"
+                + " observed=\(observedStatus?.rawValue ?? "unqueried")"
+                + " existingLocale=\(hasInstalledLocale.map(String.init) ?? "unqueried")"
+                + " installationRequest=\(installationRequested.map(String.init) ?? "unrequested")"
         }
     }
 
@@ -535,8 +640,6 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
 private enum AppleAnalyzerError: LocalizedError {
     case localeUnsupported(String)
     case assetsUnsupported
-    case assetsNotInstalled
-    case assetInstallationFailed(String)
     case audioFormatUnavailable
     case invalidAudio
     case audioConversionFailed
@@ -550,12 +653,8 @@ private enum AppleAnalyzerError: LocalizedError {
             return "此 Mac 的 Apple 本机识别不支持 \(locale)。请选择受支持的单一语种后重试；录音仍保留。"
         case .assetsUnsupported:
             return "此 Mac 不支持所选 Apple 本机模型。请选择其他受支持的语种；录音仍保留。"
-        case .assetsNotInstalled:
-            return "Apple 本机模型尚未安装完成。请检查网络和磁盘空间后重试；录音仍保留。"
-        case .assetInstallationFailed(let detail):
-            return "Apple 本机模型安装失败：\(detail)。请检查网络、磁盘空间或系统语言资源后重试；录音仍保留。"
         case .audioFormatUnavailable:
-            return "Apple 模型已安装，但没有可用的识别音频格式。请重试；录音仍保留。"
+            return "Apple 本机识别没有返回可用的音频格式。请重试或使用本地 Whisper；录音仍保留。"
         case .invalidAudio:
             return "收到的音频格式或时间无效，Apple 识别无法继续。录音仍保留，可在会后重新转写。"
         case .audioConversionFailed:
