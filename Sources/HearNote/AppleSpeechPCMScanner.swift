@@ -7,9 +7,19 @@ enum AppleSpeechPCMScanner {
     static func content(of buffer: AVAudioPCMBuffer) -> AppleSpeechAudioEvidence.Content {
         guard buffer.frameLength > 0, buffer.format.channelCount > 0 else { return .unknown }
         let buffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-        let channelsPerBuffer = buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1
-        let expectedBuffers = buffer.format.isInterleaved ? 1 : Int(buffer.format.channelCount)
-        let description = buffer.format.streamDescription.pointee
+        return content(in: buffers, format: buffer.format, frameLength: buffer.frameLength)
+    }
+
+    /// Share the exact raw-list scan with synthetic fixtures. Taking an
+    /// AVAudioPCMBuffer's mutableAudioBufferList again can refresh its byte sizes.
+    static func content(
+        in buffers: UnsafeMutableAudioBufferListPointer, format: AVAudioFormat,
+        frameLength: AVAudioFrameCount
+    ) -> AppleSpeechAudioEvidence.Content {
+        guard frameLength > 0, format.channelCount > 0 else { return .unknown }
+        let channelsPerBuffer = format.isInterleaved ? Int(format.channelCount) : 1
+        let expectedBuffers = format.isInterleaved ? 1 : Int(format.channelCount)
+        let description = format.streamDescription.pointee
         guard buffers.count == expectedBuffers,
               buffers.allSatisfy({ Int($0.mNumberChannels) == channelsPerBuffer }),
               description.mFormatID == kAudioFormatLinearPCM,
@@ -17,11 +27,11 @@ enum AppleSpeechPCMScanner {
         else { return .unknown }
         var content = AppleSpeechAudioEvidence.Content.exactlyZero
         for audio in buffers {
-            let (count, overflow) = Int(buffer.frameLength)
+            let (count, overflow) = Int(frameLength)
                 .multipliedReportingOverflow(by: Int(audio.mNumberChannels))
             guard !overflow, count > 0, let data = audio.mData else { return .unknown }
             let next: AppleSpeechAudioEvidence.Content
-            switch buffer.format.commonFormat {
+            switch format.commonFormat {
             case .pcmFormatFloat32:
                 guard packedLayout(description, bytesPerSample: MemoryLayout<Float>.stride,
                                    channelsPerBuffer: channelsPerBuffer) else { return .unknown }

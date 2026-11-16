@@ -7,6 +7,7 @@ import HearNoteCore
 struct MacSpeechEvidenceCheck {
     static func main() throws {
         var checks = 0
+        var reportedByteMetadata = false
         func expect(_ actual: AppleSpeechAudioEvidence.Content,
                     _ expected: AppleSpeechAudioEvidence.Content, _ detail: String) throws {
             guard actual == expected else { throw CheckFailure(detail: detail) }
@@ -54,11 +55,29 @@ struct MacSpeechEvidenceCheck {
                                "weak nonzero on every layout/channel: \(detail)")
 
                     zero(buffer)
+                    let suppliedFormat = buffer.format
+                    let suppliedFrames = buffer.frameLength
                     let originalByteSize = buffers[0].mDataByteSize
                     buffers[0].mDataByteSize = 1
-                    let incomplete = AppleSpeechPCMScanner.content(of: buffer)
+                    let mutatedByteSize = buffers[0].mDataByteSize
+                    // Scan the held raw list before reacquiring any AV buffer
+                    // property that could restore its expected byte length.
+                    let incomplete = AppleSpeechPCMScanner.content(
+                        in: buffers, format: suppliedFormat, frameLength: suppliedFrames
+                    )
+                    if !reportedByteMetadata {
+                        let reobtained = UnsafeMutableAudioBufferListPointer(
+                            buffer.mutableAudioBufferList
+                        )
+                        let reobtainedByteSize = reobtained[0].mDataByteSize
+                        print("Apple Speech PCM metadata: originalBytes=\(originalByteSize) mutatedBytes=\(mutatedByteSize) reobtainedBytes=\(reobtainedByteSize)")
+                        reportedByteMetadata = true
+                    }
                     buffers[0].mDataByteSize = originalByteSize
                     try expect(incomplete, .unknown, "incomplete bytes: \(detail)")
+                    try expect(AppleSpeechPCMScanner.content(
+                        in: buffers, format: suppliedFormat, frameLength: suppliedFrames + 1
+                    ), .unknown, "requested frames exceed raw bytes: \(detail)")
                     buffer.frameLength = 0
                     try expect(AppleSpeechPCMScanner.content(of: buffer), .unknown,
                                "no actual frames: \(detail)")
