@@ -26,6 +26,10 @@ if [[ ! "$hearnote_swift_version" =~ Swift\ version\ ([0-9]+)\.([0-9]+) ]] ||
 fi
 
 # 不记录环境变量、凭据或客户数据。所有测试只使用合成数据和 URLProtocol stub。
+if ! bash scripts/check-mac-recording-route.sh 2>&1 | tee dist/ci/recording-route-check.log; then
+    echo "设备切换的合成录音续写检查失败；不能标记录音恢复为已验证。" > dist/ci/结果说明.md
+    exit 1
+fi
 if ! bash scripts/build-mac.sh 2>&1 | tee dist/ci/build.log; then
     echo "macOS 构建失败；没有生成经验证的安装包。" > dist/ci/结果说明.md
     exit 1
@@ -36,10 +40,6 @@ if ! bash scripts/check-mac-echo.sh 2>&1 | tee dist/ci/echo-check.log; then
 fi
 if ! bash scripts/check-mac-speech-evidence.sh 2>&1 | tee dist/ci/speech-evidence-check.log; then
     echo "Apple 识别输入的合成 PCM 检查失败；不能标记数字静音保护为已验证。" > dist/ci/结果说明.md
-    exit 1
-fi
-if ! bash scripts/check-mac-recording-route.sh 2>&1 | tee dist/ci/recording-route-check.log; then
-    echo "设备切换的合成录音续写检查失败；不能标记录音恢复为已验证。" > dist/ci/结果说明.md
     exit 1
 fi
 if ! bash scripts/package-mac.sh 2>&1 | tee dist/ci/package.log; then

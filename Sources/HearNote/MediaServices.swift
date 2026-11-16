@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import Foundation
 import HearNoteCore
+import OSLog
 import Speech
 
 enum AppleSpeechAvailability {
@@ -652,6 +653,21 @@ final class SpeechTranscriber: ObservableObject {
     private func performNativeTranscription(
         url: URL, locale: String, contextualStrings: [String], id: UUID
     ) async throws -> [TranscriptSegment] {
+        // 只记录操作阶段及数值；不记录媒体路径、原文、错误正文或 NSError.userInfo。
+        let logger = Logger(subsystem: "app.hearnote.mac", category: "AppleSpeechFileStage")
+        let diagnosticRun = id.uuidString
+        var diagnosticStage = "decode"
+        var diagnosticSucceeded = false
+        func enter(_ stage: String) {
+            diagnosticStage = stage
+            logger.info("run=\(diagnosticRun, privacy: .public) stage=\(stage, privacy: .public) event=enter")
+        }
+        defer {
+            let completed = diagnosticSucceeded ? 1 : 0
+            let cancelled = Task.isCancelled ? 1 : 0
+            logger.notice("run=\(diagnosticRun, privacy: .public) stage=\(diagnosticStage, privacy: .public) event=end completed=\(completed, privacy: .public) cancelled=\(cancelled, privacy: .public)")
+        }
+        enter("decode")
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("hearnote-apple-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -661,6 +677,7 @@ final class SpeechTranscriber: ObservableObject {
             file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false)
         } catch {
             try checkRun(id)
+            enter("extractAudio")
             let asset = AVURLAsset(url: url)
             guard !(try await asset.loadTracks(withMediaType: .audio)).isEmpty else {
                 throw MediaServiceError.noAudio
@@ -684,12 +701,15 @@ final class SpeechTranscriber: ObservableObject {
             try await operation.run()
             activeExport = nil
             try checkRun(id)
+            enter("decodeExtracted")
             file = try AVAudioFile(forReading: audioURL, commonFormat: .pcmFormatFloat32, interleaved: false)
         }
         try checkRun(id)
         guard file.length > 0, file.processingFormat.sampleRate > 0 else {
             throw MediaServiceError.invalidDuration
         }
+        let processingFormat = file.processingFormat
+        logger.info("run=\(diagnosticRun, privacy: .public) stage=decoded frames=\(file.length, privacy: .public) rate=\(processingFormat.sampleRate, privacy: .public) channels=\(processingFormat.channelCount, privacy: .public) pcm=\(processingFormat.commonFormat.rawValue, privacy: .public)")
         let native = LiveSpeechRecognizer()
         var fileContext: AppleSpeechFileContext?
         activeNativeRecognition = native
@@ -697,6 +717,7 @@ final class SpeechTranscriber: ObservableObject {
             guard let self, self.runID == id else { return }
             self.setStatus(status)
         }
+        enter("modelPreparation")
         try await native.start(
             locale: locale, allowCloudRecognition: false, contextualStrings: contextualStrings,
             source: "录音", onUpdate: { [weak self] segment, _ in
@@ -719,6 +740,7 @@ final class SpeechTranscriber: ObservableObject {
             }
         )
         try checkRun(id)
+        enter("modelReady")
         if native.usesSpeechAnalyzer {
             guard let context = AppleSpeechFileContext(
                 duration: Double(file.length) / file.processingFormat.sampleRate,
@@ -726,9 +748,11 @@ final class SpeechTranscriber: ObservableObject {
             ) else { throw MediaServiceError.invalidDuration }
             fileContext = context
             native.configureFileDiagnostics(
-                prefixDuration: context.prefixDuration, originalDuration: context.originalDuration
+                prefixDuration: context.prefixDuration, originalDuration: context.originalDuration,
+                operationID: id
             )
             setStatus("正在转写音频，原文件保留…")
+            enter("prefixInput")
             var prefixFrame: Int64 = 0
             while let chunk = context.prefixChunk(at: prefixFrame) {
                 try checkRun(id)
@@ -751,13 +775,24 @@ final class SpeechTranscriber: ObservableObject {
             }
         }
         // 小块输入按 analyzer 消费速度等待，内存不随录音时长增长。
+        enter("fileInput")
+        var diagnosticInputs = 0
         while file.framePosition < file.length {
             try checkRun(id)
             let offset = Double(file.framePosition) / file.processingFormat.sampleRate
             guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 8192) else {
                 throw MediaServiceError.recognitionFailed("无法分配识别音频缓冲区。")
             }
+            diagnosticInputs += 1
+            let reportsInput = diagnosticInputs <= 8 || diagnosticInputs % 256 == 0
+                || file.length - file.framePosition <= 8192
+            if reportsInput {
+                logger.info("run=\(diagnosticRun, privacy: .public) stage=fileInput event=readBegin sequence=\(diagnosticInputs, privacy: .public) framePosition=\(file.framePosition, privacy: .public)")
+            }
             try file.read(into: buffer, frameCount: 8192)
+            if reportsInput {
+                logger.info("run=\(diagnosticRun, privacy: .public) stage=fileInput event=readEnd sequence=\(diagnosticInputs, privacy: .public) frames=\(buffer.frameLength, privacy: .public) framePosition=\(file.framePosition, privacy: .public)")
+            }
             guard buffer.frameLength > 0 else { break }
             let inputOffset: Double
             if let fileContext {
@@ -778,9 +813,15 @@ final class SpeechTranscriber: ObservableObject {
             await Task.yield()
         }
         try checkRun(id)
+        logger.info("run=\(diagnosticRun, privacy: .public) stage=inputFinished buffers=\(diagnosticInputs, privacy: .public) framePosition=\(file.framePosition, privacy: .public) totalFrames=\(file.length, privacy: .public)")
         setStatus("正在定稿最后一段…")
+        enter("finalization")
         await native.finish(timeout: 120)
         try checkRun(id)
+        enter("finalizationReturned")
+        let finalSegments = partialSegments.count
+        let nativeFailed = native.errorMessage == nil ? 0 : 1
+        logger.notice("run=\(diagnosticRun, privacy: .public) stage=finalizationReturned segments=\(finalSegments, privacy: .public) nativeFailed=\(nativeFailed, privacy: .public)")
         if let error = native.errorMessage {
             throw MediaServiceError.recognitionFailed(error)
         }
@@ -789,6 +830,7 @@ final class SpeechTranscriber: ObservableObject {
         }
         progress = 1
         setStatus("转写完成")
+        diagnosticSucceeded = true
         return partialSegments
     }
     #endif

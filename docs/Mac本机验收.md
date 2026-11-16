@@ -161,6 +161,38 @@ GPT 型号升级验收：旧版升级后，列表包含 `GPT 6 Luna / global.ope
 
 - 合成音频包含静音和正常语音时，新转写与四种导出不应出现 Whisper 技术占位 `[BLANK_AUDIO]`；英文词间空格、中文和时间戳仍完整。此修复只处理新识别输出，旧错误转写需要重新转写，人工输入的方括号或日志文字不应被导出器删除。
 
+### Apple 文件格式失败的阶段诊断
+
+此项只定位导入／重新转写停在“等待转写”的阶段，不代表 48 kHz 文件已经修好。使用同一份预先生成的合成英文材料，准备 22.05 kHz 与 48 kHz、单／双声道的四份 Int16 WAV；不要使用私人会议音轨。明确选择 English、Apple 本地识别，关闭实时翻译，逐份导入并单独重新转写。
+
+开始操作前在另一个 Terminal 启动以下采集，测试结束按 `Ctrl+C`。此命令只保存 App 四个指定诊断类别的时间、类别及安全消息；不收集完整系统日志、音频、笔记、媒体路径或错误正文。`apple-file-diagnostics.jsonl` 保存在执行命令的本机目录，不提交 GitHub。
+
+```bash
+/usr/bin/log stream --style ndjson --level info \
+  --predicate 'subsystem == "app.hearnote.mac" AND (category == "AppleSpeechFileStage" OR category == "AppleSpeechFile" OR category == "AppleSpeechPreparation" OR category == "AppleSpeechAudioEvidence")' \
+  | python3 -u -c '
+import json, sys
+categories = {"AppleSpeechFileStage", "AppleSpeechFile", "AppleSpeechPreparation", "AppleSpeechAudioEvidence"}
+for line in sys.stdin:
+    try:
+        item = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if item.get("category") not in categories:
+        continue
+    message = item.get("eventMessage", "")
+    if not isinstance(message, str) or not message.startswith("run="):
+        continue
+    print(json.dumps({key: item.get(key) for key in ("timestamp", "category", "eventMessage")}, ensure_ascii=False), flush=True)
+' > apple-file-diagnostics.jsonl
+```
+
+每份文件记录操作时间、采样率／声道、导入或重新转写、UI 状态、是否可取消及实际保存原文块数。逐份操作，上一任务完成或取消后再测下一份；等待时间以转写开始为起点，不能只用文件导入时间。若超过 120 秒仍未完成，记录当时 UI 后尝试取消，不强行宣布整个任务已超时；120 秒仅是开始收尾后的期限，模型下载安装另记。
+
+`AppleSpeechFileStage` 用操作 `run` 记录解码、模型准备、前置上下文、文件读入、输入完成与收尾；`AppleSpeechFile` 的 `begin` 将同一操作 `run` 与 `analyzerRun` 关联。转换日志记录首几块、第一块原文件 PCM（`firstOriginal=1`）及低频汇总；`content=0/1/2` 分别表示精确数字零／含非零样本／无法确认，不是语音质量或准确率评分。
+
+开发者据同一 `run` 的最后阶段区分解码、模型准备、转换调用、入队或最终结果停滞。只有 `conversionBegin` 没有对应 `conversionEnd`、原始格式未进入模型、原生结果没有映射为可见原文等，需分别记录；不能用一次缺日志反推唯一原因，也不能把重采样成功当成真实 Apple 识别通过。
+
 ## 7. 结果与 GitHub 同步
 
 结果注明通过、失败、未测；每个失败给复现步骤、实际结果、错误与最小修复。报告可保存为本机 `Mac本机测试结果.md`，包含 App 的实际绝对路径、测试配置、合成材料错误和速度表。截图隐藏凭据；录音、Key、用户笔记和本机日志不提交到 GitHub。

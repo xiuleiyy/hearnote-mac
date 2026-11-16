@@ -14,7 +14,7 @@ protocol AppleSpeechStreamingService: AnyObject {
     ) async throws
     func append(_ buffer: AVAudioPCMBuffer, at offset: Double?)
     func appendForTranscription(_ buffer: AVAudioPCMBuffer, at offset: Double) async throws
-    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double)
+    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double, operationID: UUID?)
     func stop()
     func finish(timeout: TimeInterval) async
     func cancel()
@@ -190,7 +190,15 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
     func appendForTranscription(_ buffer: AVAudioPCMBuffer, at offset: Double) async throws {
         if let currentFailure { throw currentFailure }
         guard let id = runID, acceptingAudio else { throw CancellationError() }
-        let converted = try convert(buffer)
+        fileDiagnostics?.recordConversionBegin(source: buffer, target: audioFormat, requestedStart: offset)
+        let converted: AVAudioPCMBuffer
+        do {
+            converted = try convert(buffer)
+        } catch {
+            fileDiagnostics?.recordConversionFailure(code: (error as NSError).code)
+            throw error
+        }
+        fileDiagnostics?.recordConversionEnd(output: converted)
         guard converted.frameLength > 0 else {
             fileDiagnostics?.recordInput(
                 sourceFrames: Int(buffer.frameLength), sourceRate: buffer.format.sampleRate,
@@ -222,12 +230,13 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         }
     }
 
-    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double) {
+    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double, operationID: UUID?) {
         guard let id = runID, acceptingAudio,
               prefixDuration.isFinite, prefixDuration >= 0,
               originalDuration.isFinite, originalDuration > 0 else { return }
         fileDiagnostics = FileDiagnostics(
-            id: id, prefixDuration: prefixDuration, originalDuration: originalDuration
+            id: id, operationID: operationID, prefixDuration: prefixDuration,
+            originalDuration: originalDuration
         )
     }
 
@@ -507,6 +516,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
             inputStatus.pointee = .haveData
             return buffer
         }
+        fileDiagnostics?.recordConversionStatus(status.rawValue)
         if status == .error {
             if let conversionError { throw conversionError }
             throw AppleAnalyzerError.audioConversionFailed
@@ -604,13 +614,59 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         private let run: String
         private let logger = Logger(subsystem: "app.hearnote.mac", category: "AppleSpeechFile")
         private var inputs = 0
+        private var conversions = 0
+        private let prefixDuration: Double
+        private var sawOriginalInput = false
+        private var isFirstOriginalConversion = false
         private var results = 0
         private var sourceSeconds = 0.0
         private var convertedSeconds = 0.0
 
-        init(id: UUID, prefixDuration: Double, originalDuration: Double) {
-            run = id.uuidString
-            logger.info("run=\(self.run, privacy: .public) event=begin prefixSeconds=\(prefixDuration, privacy: .public) originalSeconds=\(originalDuration, privacy: .public)")
+        init(id: UUID, operationID: UUID?, prefixDuration: Double, originalDuration: Double) {
+            run = (operationID ?? id).uuidString
+            self.prefixDuration = prefixDuration
+            let analyzerRun = id.uuidString
+            logger.info("run=\(self.run, privacy: .public) analyzerRun=\(analyzerRun, privacy: .public) event=begin prefixSeconds=\(prefixDuration, privacy: .public) originalSeconds=\(originalDuration, privacy: .public)")
+        }
+
+        private var reportsConversion: Bool {
+            conversions <= 8 || conversions % 256 == 0 || isFirstOriginalConversion
+        }
+
+        func recordConversionBegin(source: AVAudioPCMBuffer, target: AVAudioFormat?,
+                                   requestedStart: Double) {
+            conversions += 1
+            isFirstOriginalConversion = !sawOriginalInput
+                && requestedStart.isFinite && requestedStart >= prefixDuration
+            if isFirstOriginalConversion { sawOriginalInput = true }
+            guard reportsConversion else { return }
+            let sourceFormat = source.format
+            let targetRate = target?.sampleRate ?? 0
+            let targetChannels = target?.channelCount ?? 0
+            let targetCommonFormat = target?.commonFormat.rawValue ?? 0
+            let conversionRequired = target.map { sourceFormat == $0 ? 0 : 1 } ?? -1
+            let original = isFirstOriginalConversion ? 1 : 0
+            logger.info("run=\(self.run, privacy: .public) event=conversionBegin sequence=\(self.conversions, privacy: .public) firstOriginal=\(original, privacy: .public) sourceFrames=\(source.frameLength, privacy: .public) sourceRate=\(sourceFormat.sampleRate, privacy: .public) sourceChannels=\(sourceFormat.channelCount, privacy: .public) sourcePCM=\(sourceFormat.commonFormat.rawValue, privacy: .public) targetRate=\(targetRate, privacy: .public) targetChannels=\(targetChannels, privacy: .public) targetPCM=\(targetCommonFormat, privacy: .public) conversionRequired=\(conversionRequired, privacy: .public)")
+        }
+
+        func recordConversionStatus(_ status: Int) {
+            guard reportsConversion else { return }
+            logger.info("run=\(self.run, privacy: .public) event=conversionStatus sequence=\(self.conversions, privacy: .public) status=\(status, privacy: .public)")
+        }
+
+        func recordConversionEnd(output: AVAudioPCMBuffer) {
+            guard reportsConversion else { return }
+            let content: Int
+            switch AppleSpeechPCMScanner.content(of: output) {
+            case .exactlyZero: content = 0
+            case .nonzero: content = 1
+            case .unknown: content = 2
+            }
+            logger.info("run=\(self.run, privacy: .public) event=conversionEnd sequence=\(self.conversions, privacy: .public) outputFrames=\(output.frameLength, privacy: .public) outputRate=\(output.format.sampleRate, privacy: .public) outputChannels=\(output.format.channelCount, privacy: .public) content=\(content, privacy: .public)")
+        }
+
+        func recordConversionFailure(code: Int) {
+            logger.error("run=\(self.run, privacy: .public) event=conversionFailed sequence=\(self.conversions, privacy: .public) code=\(code, privacy: .public)")
         }
 
         func recordInput(sourceFrames: Int, sourceRate: Double, convertedFrames: Int,
@@ -619,7 +675,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
             inputs += 1
             sourceSeconds += Double(sourceFrames) / sourceRate
             convertedSeconds += Double(convertedFrames) / convertedRate
-            guard inputs <= 8 else { return }
+            guard inputs <= 8 || reportsConversion else { return }
             logger.info("run=\(self.run, privacy: .public) event=input sequence=\(self.inputs, privacy: .public) sourceFrames=\(sourceFrames, privacy: .public) sourceRate=\(sourceRate, privacy: .public) convertedFrames=\(convertedFrames, privacy: .public) convertedRate=\(convertedRate, privacy: .public) requestedStart=\(requestedStart, privacy: .public) inputEnd=\(inputEnd, privacy: .public) enqueued=\(enqueued, privacy: .public)")
         }
 

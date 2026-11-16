@@ -1,4 +1,5 @@
 import AVFoundation
+import Darwin
 import Foundation
 
 /// Exercises the production sink with synthetic PCM only. No engine, device,
@@ -72,9 +73,12 @@ struct MacRecordingRouteCheck {
                               hostTime: hostTime + Double(offset) / rate, input: id) {}
                 offset += count
             }
-            deliveries += try mixed.retireInput(id)
+            let retiredResults = try mixed.retireInput(id)
+            deliveries += retiredResults
             expectedFrames = Int(((hostTime - 100) * 48_000).rounded())
                 + Int((Double(frames) * 48_000 / rate).rounded())
+            let deliveredFrames = retiredResults.compactMap(\.buffer).reduce(0) { $0 + Int($1.frameLength) }
+            print("Mac route epoch: sourceRate=\(rate) sourceChannels=\(channels) sourceFrames=\(frames) targetRate=\(stable.sampleRate) targetChannels=\(stable.channelCount) inputStartHost=\(hostTime) deliveredFrames=\(deliveredFrames) firstDeliveredHost=\(retiredResults.first?.hostTime ?? -1) lastDeliveredHost=\(retiredResults.last?.hostTime ?? -1) lastElapsed=\(retiredResults.last?.elapsed ?? -1) expectedSavedFrames=\(expectedFrames)")
         }
         deliveries += try mixed.close()
         try expect(deliveries.allSatisfy { $0.error == nil }, "route conversion and EOS retain all tails")
@@ -82,7 +86,11 @@ struct MacRecordingRouteCheck {
         try expect(zip(deliveries, deliveries.dropFirst()).allSatisfy { $0.0.hostTime < $0.1.hostTime },
                    "format changes keep one increasing host timeline")
         let mixedSamples = try read(mixedURL)
-        try expect(mixedSamples.count == expectedFrames, "saved route gaps and format durations match host timeline")
+        let readFormat = try AVAudioFile(forReading: mixedURL).processingFormat
+        print("Mac route file: actualFrames=\(mixedSamples.count) expectedFrames=\(expectedFrames) firstHost=\(mixed.capturedStartHostTime ?? -1) lastElapsed=\(deliveries.last?.elapsed ?? -1) actualRate=\(readFormat.sampleRate) actualChannels=\(readFormat.channelCount)")
+        fflush(stdout)
+        try expect(mixedSamples.count == expectedFrames,
+                   "saved route gaps and format durations match host timeline actual=\(mixedSamples.count) expected=\(expectedFrames) targetRate=\(stable.sampleRate) targetChannels=\(stable.channelCount)")
         try expect(mixedSamples[5_000..<11_500].allSatisfy { $0 == 0 }, "route gap is stored as silence at the original offset")
         try expect(mixedSamples[0..<4_800].contains { abs($0) > 0.0001 }, "earlier microphone PCM remains readable")
         try expect(mixedSamples.suffix(160).contains { abs($0) > 0.0001 }, "final short native tail survives EOS")

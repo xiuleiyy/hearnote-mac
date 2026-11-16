@@ -10,9 +10,9 @@ final class LiveSpeechRecognizer: ObservableObject {
     /// 文件端只为新分析器补充起始上下文，旧识别和实时采集保持各自输入策略。
     var usesSpeechAnalyzer: Bool { analyzerService != nil }
 
-    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double) {
+    func configureFileDiagnostics(prefixDuration: Double, originalDuration: Double, operationID: UUID? = nil) {
         analyzerService?.configureFileDiagnostics(
-            prefixDuration: prefixDuration, originalDuration: originalDuration
+            prefixDuration: prefixDuration, originalDuration: originalDuration, operationID: operationID
         )
     }
 
