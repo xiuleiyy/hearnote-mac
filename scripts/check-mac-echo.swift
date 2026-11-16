@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import HearNoteCore
 
 private enum HarnessFailure: Error { case assertion(String) }
 
@@ -367,7 +368,7 @@ struct MacEchoHarness {
             let time = epoch + Double(start) / 16_000
             processor.appendReference(try buffer(rate: 16_000, start: start, count: 160) { _ in 0 },
                                       hostTime: time)
-            processor.appendMicrophone(try buffer(rate: 16_000, start: start, count: 160) { _ in 0.03 },
+            processor.appendMicrophone(try buffer(rate: 16_000, start: start, count: 160) { _ in start == 0 ? 0.03 : 0.07 },
                                        hostTime: time)
             if start == 0 {
                 processor.audioRouteDidChange()
@@ -380,8 +381,21 @@ struct MacEchoHarness {
         try verifyFile(result, collector: collector, expected: 320, name: "route-partial-frame")
         try require(result.diagnostics.filterResetReasonCounts?.audioRouteChange == 1,
                     "route-partial-frame: missing route reset")
-        try require(collector.samples.allSatisfy { abs($0 - 0.03) < 0.0001 },
-                    "route-partial-frame: route reset muted retained voice")
+        // Speex also filters DC even with a zero reference. Compare against
+        // the actual two independently filtered half-frames, rather than
+        // incorrectly expecting the constant input to remain unchanged.
+        let baseline = try AcousticEchoCanceller()
+        let reference = [Float](repeating: 0, count: 320)
+        func padded(_ value: Float) -> [Float] {
+            [Float](repeating: value, count: 160) + [Float](repeating: 0, count: 160)
+        }
+        let before = Array(baseline.process(microphone: padded(0.03), reference: reference).prefix(160))
+        baseline.reset()
+        let after = Array(baseline.process(microphone: padded(0.07), reference: reference).prefix(160))
+        let expected = before + after
+        try require(collector.samples.count == expected.count && result.frameCount == 320
+                    && zip(collector.samples, expected).allSatisfy { abs($0.0 - $0.1) < 0.000_001 },
+                    "route-partial-frame: retired and resumed voice differs from the DSP baseline")
         processor.audioRouteDidChange()
         let stopped = await processor.finish()
         try require(stopped.frameCount == result.frameCount
