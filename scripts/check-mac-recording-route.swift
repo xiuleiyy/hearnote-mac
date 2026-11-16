@@ -86,8 +86,9 @@ struct MacRecordingRouteCheck {
         try expect(zip(deliveries, deliveries.dropFirst()).allSatisfy { $0.0.hostTime < $0.1.hostTime },
                    "format changes keep one increasing host timeline")
         let mixedSamples = try read(mixedURL)
-        let readFormat = try AVAudioFile(forReading: mixedURL).processingFormat
-        print("Mac route file: actualFrames=\(mixedSamples.count) expectedFrames=\(expectedFrames) firstHost=\(mixed.capturedStartHostTime ?? -1) lastElapsed=\(deliveries.last?.elapsed ?? -1) actualRate=\(readFormat.sampleRate) actualChannels=\(readFormat.channelCount)")
+        let readFile = try AVAudioFile(forReading: mixedURL)
+        let readFormat = readFile.processingFormat
+        print("Mac route file: actualFrames=\(mixedSamples.count) declaredFrames=\(readFile.length) expectedFrames=\(expectedFrames) firstHost=\(mixed.capturedStartHostTime ?? -1) lastElapsed=\(deliveries.last?.elapsed ?? -1) actualRate=\(readFormat.sampleRate) actualChannels=\(readFormat.channelCount)")
         fflush(stdout)
         try expect(mixedSamples.count == expectedFrames,
                    "saved route gaps and format durations match host timeline actual=\(mixedSamples.count) expected=\(expectedFrames) targetRate=\(stable.sampleRate) targetChannels=\(stable.channelCount)")
@@ -211,14 +212,48 @@ struct MacRecordingRouteCheck {
 
     private static func readChannels(_ url: URL) throws -> [[Float]] {
         let file = try AVAudioFile(forReading: url)
+        let declaredFrames = file.length
+        let trace = url.lastPathComponent == "mixed-routes.caf"
+        if trace {
+            print("Mac route read: declaredFrames=\(declaredFrames) initialPosition=\(file.framePosition) rate=\(file.processingFormat.sampleRate) channels=\(file.processingFormat.channelCount)")
+            fflush(stdout)
+        }
+        guard declaredFrames >= 0 else { throw CheckFailure(description: "invalid saved frame count") }
+        let capacity = AVAudioFrameCount(min(8_192, max(1, declaredFrames)))
         guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
-                                           frameCapacity: AVAudioFrameCount(file.length)) else {
+                                           frameCapacity: capacity) else {
             throw CheckFailure(description: "saved synthetic PCM allocation")
         }
-        try file.read(into: buffer)
-        guard let samples = buffer.floatChannelData else { throw CheckFailure(description: "saved Float PCM") }
-        return (0..<Int(buffer.format.channelCount)).map {
-            Array(UnsafeBufferPointer(start: samples[$0], count: Int(buffer.frameLength)))
+        var saved = Array(repeating: [Float](), count: Int(buffer.format.channelCount))
+        while file.framePosition < declaredFrames {
+            let before = file.framePosition
+            let requested = AVAudioFrameCount(min(AVAudioFramePosition(capacity), declaredFrames - before))
+            buffer.frameLength = 0
+            try file.read(into: buffer, frameCount: requested)
+            let actual = buffer.frameLength
+            let after = file.framePosition
+            if trace || actual < requested {
+                print("Mac route read chunk: declaredFrames=\(declaredFrames) before=\(before) requested=\(requested) actual=\(actual) after=\(after) rate=\(buffer.format.sampleRate) channels=\(buffer.format.channelCount)")
+                fflush(stdout)
+            }
+            guard actual > 0, after - before == AVAudioFramePosition(actual),
+                  actual <= requested else {
+                throw CheckFailure(description: "saved PCM read made incomplete progress declared=\(declaredFrames) before=\(before) requested=\(requested) actual=\(actual) after=\(after) rate=\(buffer.format.sampleRate) channels=\(buffer.format.channelCount)")
+            }
+            guard let samples = buffer.floatChannelData else { throw CheckFailure(description: "saved Float PCM") }
+            for channel in saved.indices {
+                saved[channel].append(contentsOf: UnsafeBufferPointer(
+                    start: samples[channel], count: Int(actual)
+                ))
+            }
         }
+        guard saved.allSatisfy({ $0.count == Int(declaredFrames) }) else {
+            throw CheckFailure(description: "saved PCM read length declared=\(declaredFrames) actual=\(saved.first?.count ?? -1) finalPosition=\(file.framePosition) rate=\(buffer.format.sampleRate) channels=\(buffer.format.channelCount)")
+        }
+        if trace {
+            print("Mac route read complete: declaredFrames=\(declaredFrames) actualFrames=\(saved.first?.count ?? 0) finalPosition=\(file.framePosition)")
+            fflush(stdout)
+        }
+        return saved
     }
 }

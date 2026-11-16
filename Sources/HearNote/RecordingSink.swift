@@ -157,6 +157,9 @@ final class RecordingSink: @unchecked Sendable {
         lock.lock()
         defer {
             inputID = nil
+            // Finalize the writer header before callers open the saved file.
+            // macOS 14 closes it by releasing the last AVAudioFile reference.
+            if #available(macOS 15.0, *) { file?.close() }
             file = nil
             lock.unlock()
         }
