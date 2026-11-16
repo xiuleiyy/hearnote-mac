@@ -910,7 +910,7 @@ private struct RecordingEchoStatusView: View {
             Label(recorder.echoStatus, systemImage: "waveform.path")
                 .font(.caption2).foregroundStyle(.secondary)
                 .lineLimit(expanded ? nil : 1)
-                .help(recorder.echoStatus)
+                .help("参考覆盖和处理比例只表示音频进入了处理流程，不代表回声已消除。电平衰减包含自己的讲话、噪声和回声；请对照原始与处理后的音轨。")
                 .textSelection(.enabled)
         }
     }

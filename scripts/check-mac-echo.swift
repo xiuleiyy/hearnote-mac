@@ -59,6 +59,11 @@ struct MacEchoHarness {
         try await conversionWithoutReference(rate: 48_000, chunk: 1_024, root: root)
         try await continuousReference(referenceRate: 48_000, microphoneRate: 44_100, root: root)
         try await continuousReference(referenceRate: 44_100, microphoneRate: 48_000, root: root)
+        try await referenceCumulativeDrift(root: root)
+        try await adaptationAfterReset(.missingReference, root: root)
+        try await adaptationAfterReset(.invalidReference, root: root)
+        try await adaptationAfterReset(.invalidMicrophone, root: root)
+        try await adaptationAfterReset(.referenceFormat, root: root)
         try await lateReference(captureAge: 0, root: root)
         try await lateReference(captureAge: 0.25, root: root)
         try await wholePacketDeadline(root: root)
@@ -71,7 +76,7 @@ struct MacEchoHarness {
         try await cancelIsolation(root: root)
         try originalTracksPersist(root: root)
         try originalTracksPreservedOnArchiveFailure(root: root)
-        print("Mac echo integration: 16 synthetic checks passed; no microphone, model, or API permission used.")
+        print("Mac echo integration: 21 synthetic checks passed; no microphone, model, or API permission used. These checks do not establish hardware AEC effectiveness.")
     }
 
     static func hostNow() -> Double {
@@ -181,6 +186,159 @@ struct MacEchoHarness {
         try require(abs(Int(result.referenceSamplesMatched) - 32_000) <= 8,
                     "\(name): reference did not cover the converted microphone")
         try require(collector.samples.allSatisfy(\.isFinite), "\(name): nonfinite output")
+    }
+
+    @MainActor
+    private static func referenceCumulativeDrift(root: URL) async throws {
+        // Each neighbor differs by only one 16kHz sample (0.0625ms), which
+        // satisfies the 2ms adjacent-packet check while drift accumulates.
+        for (packets, expectedMaximum, expectedReanchors) in [(81, 80, 0), (82, 81, 1), (164, 81, 2)] {
+            let collector = Collector()
+            let epoch = hostNow()
+            let name = "reference-drift-\(packets)"
+            let processor = try processor(name: name, root: root, epoch: epoch, collector: collector)
+            for index in 0..<packets {
+                let pcm = try buffer(rate: 16_000, start: index * 320, count: 320) {
+                    Float(0.12 * sin(2 * .pi * 310 * $0))
+                }
+                processor.appendReference(pcm, hostTime: epoch + Double(index * 321) / 16_000)
+            }
+            let result = await processor.finish()
+            try require(result.failure == nil, "\(name): reference-only processing failed")
+            try require(result.diagnostics.referenceMaximumContinuousDriftFrames == Int64(expectedMaximum),
+                        "\(name): cumulative timestamp drift not measured")
+            try require(result.diagnostics.referenceDriftReanchors == Int64(expectedReanchors),
+                        "\(name): 80-frame bound or repeated reanchoring is incorrect")
+            guard let resets = result.diagnostics.filterResetReasonCounts else {
+                throw HarnessFailure.assertion("\(name): missing reset diagnostics")
+            }
+            try require(resets.referenceDiscontinuity == 1, "\(name): adjacent packets were misclassified as gaps")
+            try require(resets.referenceDrift == Int64(expectedReanchors), "\(name): drift reset classification")
+            try require(result.diagnostics.filterResets == Int64(1 + expectedReanchors),
+                        "\(name): filter did not reset exactly once per reanchor")
+            diagnostic("\(name) maximumDriftFrames=\(expectedMaximum) driftReanchors=\(expectedReanchors)")
+        }
+    }
+
+    private enum AdaptationReset: String {
+        case missingReference, invalidReference, invalidMicrophone, referenceFormat
+    }
+
+    @MainActor
+    private static func adaptationAfterReset(_ kind: AdaptationReset, root: URL) async throws {
+        let collector = Collector()
+        let clock = TestClock()
+        let epoch = hostNow()
+        let name = "adaptation-reset-\(kind.rawValue)"
+        let processor = try processor(name: name, root: root, epoch: epoch, collector: collector, clock: clock)
+        let packetSamples = 640
+        let initialSamples = 64_000
+        let resumedSamples = 16_000
+
+        func appendPair(start: Int, referenceChannels: AVAudioChannelCount = 1,
+                        invalidReference: Bool = false, invalidMicrophone: Bool = false,
+                        omitReference: Bool = false) throws {
+            if !omitReference {
+                let reference = try buffer(rate: 16_000, channels: referenceChannels,
+                                           start: start, count: packetSamples) {
+                    invalidReference ? 2 : Float(0.12 * sin(2 * .pi * 310 * $0))
+                }
+                processor.appendReference(reference, hostTime: epoch + Double(start) / 16_000)
+            }
+            let microphone = try buffer(rate: 16_000, start: start, count: packetSamples) {
+                invalidMicrophone ? 2 : Float(0.08 * sin(2 * .pi * 710 * $0))
+            }
+            processor.appendMicrophone(microphone, hostTime: epoch + Double(start) / 16_000)
+        }
+
+        for start in stride(from: 0, to: initialSamples, by: packetSamples) {
+            clock.advance(to: Double(start) / 16_000)
+            try appendPair(start: start)
+            await processor.synchronize()
+        }
+        try require(collector.statuses.contains { $0.contains("正在适应声音") }, "\(name): initial history hint missing")
+        try require(collector.statuses.last?.hasPrefix("回声处理中 ·") == true,
+                    "\(name): uninterrupted processing never left the initial history hint")
+        collector.statuses.removeAll()
+
+        clock.advance(to: 4)
+        try appendPair(
+            start: initialSamples,
+            referenceChannels: kind == .referenceFormat ? 2 : 1,
+            invalidReference: kind == .invalidReference,
+            invalidMicrophone: kind == .invalidMicrophone,
+            omitReference: kind == .missingReference
+        )
+        await processor.synchronize()
+        if kind == .missingReference {
+            clock.advance(to: 4.25)
+            await processor.synchronize()
+        }
+        let resumedStart = initialSamples + packetSamples
+        for offset in stride(from: 0, to: resumedSamples, by: packetSamples) {
+            clock.advance(to: 4.5 + Double(offset) / 16_000)
+            try appendPair(start: resumedStart + offset)
+            await processor.synchronize()
+        }
+        let result = await processor.finish()
+        try verifyFile(result, collector: collector,
+                       expected: initialSamples + packetSamples + resumedSamples, name: name)
+        try require(result.diagnostics.processedSamples > 48_000, "\(name): baseline processing was not exercised")
+        guard let continuous = result.diagnostics.continuousProcessedSamples,
+              let resets = result.diagnostics.filterResetReasonCounts else {
+            throw HarnessFailure.assertion("\(name): missing continuity diagnostics")
+        }
+        try require(continuous > 0 && continuous < 48_000,
+                    "\(name): reset did not restart continuous-processing history")
+        try require(collector.statuses.last?.contains("正在适应声音") == true,
+                    "\(name): lifetime total suppressed the post-reset history hint")
+        switch kind {
+        case .missingReference:
+            try require(resets.missingReference > 0, "\(name): missing-reference reset absent")
+            try require(resets.missingReference * 320 == result.diagnostics.missingReferenceSamples,
+                        "\(name): missing reference reset was counted more than once")
+        case .invalidReference:
+            try require(resets.invalidReference > 0, "\(name): invalid-reference reset absent")
+            try require(resets.invalidReference * 320 == result.diagnostics.invalidReferenceSamples,
+                        "\(name): invalid reference reset was counted more than once")
+        case .invalidMicrophone:
+            try require(resets.invalidMicrophone > 0, "\(name): invalid-microphone reset absent")
+            try require(resets.invalidMicrophone * 320 == result.diagnostics.invalidMicrophoneSamples,
+                        "\(name): invalid microphone reset was counted more than once")
+        case .referenceFormat:
+            try require(resets.referenceDiscontinuity >= 3,
+                        "\(name): reference format changes did not reset filter history")
+        }
+        let resetTotal = resets.microphoneDiscontinuity + resets.referenceDiscontinuity
+            + resets.referenceDrift + resets.missingReference + resets.invalidMicrophone
+            + resets.invalidReference + resets.processorFailure
+        try require(resetTotal == result.diagnostics.filterResets, "\(name): reset-reason counts disagree with total")
+        let encoded = try JSONEncoder().encode(result.diagnostics)
+        if kind == .missingReference {
+            guard var legacy = try JSONSerialization.jsonObject(with: encoded) as? [String: Any],
+                  let reasonFields = legacy["filterResetReasonCounts"] as? [String: Any] else {
+                throw HarnessFailure.assertion("\(name): reset diagnostics were not encoded")
+            }
+            let allowedReasons: Set<String> = [
+                "microphoneDiscontinuity", "referenceDiscontinuity", "referenceDrift",
+                "missingReference", "invalidMicrophone", "invalidReference", "processorFailure"
+            ]
+            try require(Set(reasonFields.keys) == allowedReasons, "\(name): reset causes are not a fixed allowlist")
+            for key in ["referenceMaximumContinuousDriftFrames", "referenceDriftReanchors",
+                        "filterResetReasonCounts", "continuousProcessedSamples"] {
+                legacy.removeValue(forKey: key)
+            }
+            let decoded = try JSONDecoder().decode(MeetingEchoProcessor.Diagnostics.self,
+                from: JSONSerialization.data(withJSONObject: legacy))
+            try require(decoded.filterResets == result.diagnostics.filterResets,
+                        "\(name): legacy diagnostics totals changed while decoding")
+            try require(decoded.referenceMaximumContinuousDriftFrames == nil
+                        && decoded.referenceDriftReanchors == nil
+                        && decoded.filterResetReasonCounts == nil
+                        && decoded.continuousProcessedSamples == nil,
+                        "\(name): archived diagnostics require the newly added fields")
+        }
+        diagnostic("\(name) totalProcessedSamples=\(result.diagnostics.processedSamples) continuousProcessedSamples=\(continuous) filterResets=\(resetTotal)")
     }
 
     @MainActor

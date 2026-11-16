@@ -21,6 +21,17 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         }
     }
 
+    /// Fixed scalar properties prevent free-text reset causes entering archives.
+    struct FilterResetReasonCounts: Codable, Sendable {
+        var microphoneDiscontinuity: Int64 = 0
+        var referenceDiscontinuity: Int64 = 0
+        var referenceDrift: Int64 = 0
+        var missingReference: Int64 = 0
+        var invalidMicrophone: Int64 = 0
+        var invalidReference: Int64 = 0
+        var processorFailure: Int64 = 0
+    }
+
     /// Energy changes include local speech and noise; they do not measure ERLE
     /// or establish that speaker echo was successfully removed.
     struct Diagnostics: Codable, Sendable {
@@ -39,6 +50,17 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         let inputRMS: Double?
         let outputRMS: Double?
         let referenceRMS: Double?
+        // Optional additions keep previously archived diagnostics decodable.
+        // Drift is measured only while adjacent source packets remain continuous.
+        let referenceMaximumContinuousDriftFrames: Int64?
+        let referenceDriftReanchors: Int64?
+        let filterResetReasonCounts: FilterResetReasonCounts?
+        let continuousProcessedSamples: Int64?
+    }
+
+    private enum FilterResetReason {
+        case microphoneDiscontinuity, referenceDiscontinuity, referenceDrift
+        case missingReference, invalidMicrophone, invalidReference, processorFailure
     }
 
     struct Result: Sendable {
@@ -123,6 +145,10 @@ final class MeetingEchoProcessor: @unchecked Sendable {
     private var invalidMicrophoneSamples: Int64 = 0
     private var invalidReferenceSamples: Int64 = 0
     private var filterResets: Int64 = 0
+    private var referenceMaximumContinuousDriftFrames: Int64 = 0
+    private var referenceDriftReanchors: Int64 = 0
+    private var filterResetReasonCounts = FilterResetReasonCounts()
+    private var continuousProcessedSamples: Int64 = 0
     private var inputEnergy = Energy()
     private var outputEnergy = Energy()
     private var referenceEnergy = Energy()
@@ -191,7 +217,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                     // Device gaps must not concatenate unrelated acoustic histories.
                     drainMicrophone(finishing: true)
                     guard failure == nil else { deliver(packet); return }
-                    resetFilter()
+                    resetFilter(reason: .microphoneDiscontinuity)
                     self.pendingStart = nil
                 }
                 if pendingStart == nil { pendingStart = start }
@@ -214,17 +240,28 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         queue.async { [self, packet] in
             guard !isCancelled, !finished, failure == nil else { return }
             do {
-                let continuous = referenceConverter?.inputFormat == packet.buffer.format
+                let stampedStart = try frameIndex(packet.hostTime)
+                let adjacentContinuous = referenceConverter?.inputFormat == packet.buffer.format
                     && referenceExpectedHostTime.map { abs(packet.hostTime - $0) <= 0.002 } == true
+                let drift = referenceNextFrame.map { abs(stampedStart - $0) }
+                if adjacentContinuous, let drift {
+                    referenceMaximumContinuousDriftFrames = max(referenceMaximumContinuousDriftFrames, drift)
+                }
+                // Small per-packet timestamp differences can accumulate despite
+                // passing the adjacent-packet check. Use the microphone's bound.
+                let driftExceeded = adjacentContinuous && drift.map { $0 > 80 } == true
+                let continuous = adjacentContinuous && drift.map { $0 <= 80 } == true
                 let samples = try convertedSamples(packet.buffer, reference: true)
                 referenceFormat = AudioFormat(packet.buffer.format)
-                let stampedStart = try frameIndex(packet.hostTime)
                 let start = continuous ? (referenceNextFrame ?? stampedStart) : stampedStart
                 referenceExpectedHostTime = packet.hostTime
                     + Double(packet.buffer.frameLength) / packet.buffer.format.sampleRate
                 referenceNextFrame = start + Int64(samples.count)
                 guard !samples.isEmpty else { return }
-                if !continuous { resetFilter() }
+                if !continuous {
+                    if driftExceeded { referenceDriftReanchors += 1 }
+                    resetFilter(reason: driftExceeded ? .referenceDrift : .referenceDiscontinuity)
+                }
                 references.append(Reference(start: start, samples: samples))
                 references.sort { $0.start < $1.start }
                 // Four seconds is a hard bound even if the microphone never delivers.
@@ -508,32 +545,53 @@ final class MeetingEchoProcessor: @unchecked Sendable {
             missingReferenceSamples: missingReferenceSamples, processedSamples: processedSamples,
             passthroughSamples: passthroughSamples, invalidMicrophoneSamples: invalidMicrophoneSamples,
             invalidReferenceSamples: invalidReferenceSamples, filterResets: filterResets,
-            inputRMS: inputEnergy.rms, outputRMS: outputEnergy.rms, referenceRMS: referenceEnergy.rms
+            inputRMS: inputEnergy.rms, outputRMS: outputEnergy.rms, referenceRMS: referenceEnergy.rms,
+            referenceMaximumContinuousDriftFrames: referenceMaximumContinuousDriftFrames,
+            referenceDriftReanchors: referenceDriftReanchors,
+            filterResetReasonCounts: filterResetReasonCounts,
+            continuousProcessedSamples: continuousProcessedSamples
         )
     }
 
-    private func resetFilter() {
+    private func resetFilter(reason: FilterResetReason) {
         canceller.reset()
+        recordFilterReset(reason: reason)
+    }
+
+    private func recordFilterReset(reason: FilterResetReason) {
         filterResets += 1
+        continuousProcessedSamples = 0
+        switch reason {
+        case .microphoneDiscontinuity: filterResetReasonCounts.microphoneDiscontinuity += 1
+        case .referenceDiscontinuity: filterResetReasonCounts.referenceDiscontinuity += 1
+        case .referenceDrift: filterResetReasonCounts.referenceDrift += 1
+        case .missingReference: filterResetReasonCounts.missingReference += 1
+        case .invalidMicrophone: filterResetReasonCounts.invalidMicrophone += 1
+        case .invalidReference: filterResetReasonCounts.invalidReference += 1
+        case .processorFailure: filterResetReasonCounts.processorFailure += 1
+        }
     }
 
     private func recordDisposition(count: Int) {
         switch canceller.lastFrameDisposition {
         case .processed:
             processedSamples += Int64(count)
+            continuousProcessedSamples += Int64(count)
         case .invalidMicrophone:
             invalidMicrophoneSamples += Int64(count)
             passthroughSamples += Int64(count)
-            filterResets += 1
+            // These pass-through dispositions already reset the core filter.
+            recordFilterReset(reason: .invalidMicrophone)
         case .invalidReference:
             invalidReferenceSamples += Int64(count)
             passthroughSamples += Int64(count)
-            filterResets += 1
+            recordFilterReset(reason: .invalidReference)
         case .missingReference:
             passthroughSamples += Int64(count)
-            filterResets += 1
+            recordFilterReset(reason: .missingReference)
         case .notProcessed:
             passthroughSamples += Int64(count)
+            continuousProcessedSamples = 0
         }
     }
 
@@ -560,7 +618,8 @@ final class MeetingEchoProcessor: @unchecked Sendable {
                 let attenuation = 20 * log10(input / output)
                 change = String(format: " · 麦克风电平衰减 %.1f dB", attenuation)
             }
-            let adapting = processedSamples < Int64(Self.sampleRate * 3) ? "（正在适应声音）" : ""
+            // This is only a startup/history hint, not an AEC success criterion.
+            let adapting = continuousProcessedSamples < Int64(Self.sampleRate * 3) ? "（正在适应声音）" : ""
             return "回声处理中\(adapting) · \(ratios)\(change)"
         case .missingReference, .notProcessed:
             return "系统参考暂未就绪，麦克风原音透传 · \(ratios)"
@@ -639,7 +698,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         pendingDeadlines.removeAll()
         pendingStart = nil
         references.removeAll()
-        resetFilter()
+        resetFilter(reason: .processorFailure)
         setStatus(failure!)
     }
 
