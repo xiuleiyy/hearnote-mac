@@ -708,6 +708,7 @@ struct RecordingView: View {
                       systemImage: "sparkles")
                     .font(.caption).foregroundStyle(.secondary)
                 RecordingAudioStatusView(recorder: state.recorder)
+                RecordingRouteStatusView(recorder: state.recorder, expanded: true)
                 RecordingEchoStatusView(recorder: state.recorder, expanded: true)
                 if state.isPreparingMeetingRecognition {
                     Text("录音继续保存；模型就绪后识别新声音，准备期间的音频可在会后重新转写。")
@@ -761,6 +762,7 @@ struct RecordingView: View {
                     .lineLimit(1).help(state.liveTranslationStatus)
             }
             .font(.caption2).foregroundStyle(.secondary)
+            RecordingRouteStatusView(recorder: state.recorder)
             RecordingEchoStatusView(recorder: state.recorder)
             if state.isPreparingMeetingRecognition {
                 HStack(alignment: .top, spacing: 12) {
@@ -896,6 +898,22 @@ struct RecordingView: View {
                 Label("开始录音", systemImage: "mic.fill")
             }.buttonStyle(.borderedProminent).tint(Palette.actionFill)
                 .disabled(state.isBusy || state.isQuitting).fixedSize()
+        }
+    }
+}
+
+@MainActor
+private struct RecordingRouteStatusView: View {
+    @ObservedObject var recorder: MeetingRecorder
+    var expanded = false
+
+    var body: some View {
+        if !recorder.microphoneRecoveryStatus.isEmpty {
+            Label(recorder.microphoneRecoveryStatus, systemImage: "arrow.triangle.2.circlepath")
+                .font(.caption2).foregroundStyle(.secondary)
+                .lineLimit(expanded ? nil : 1)
+                .help(recorder.microphoneRecoveryStatus)
+                .textSelection(.enabled)
         }
     }
 }

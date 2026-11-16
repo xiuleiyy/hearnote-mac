@@ -204,25 +204,39 @@ final class MediaPlayer: ObservableObject {
     }
 }
 
-/// 单次麦克风采集同时写文件和供应实时识别，不另开第二个输入流。
+private struct AudioRouteRecoveryFailure: LocalizedError {
+    var errorDescription: String? {
+        "音频设备切换后，麦克风未能恢复。录音已停止，已录内容会保留；请检查当前输入设备后重新开始。"
+    }
+}
+
+/// 单次会议保留同一个文件；耳机切换只重建硬件输入，不结束识别或翻译。
 @MainActor
 final class AudioRecorder: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var elapsed: Double = 0
     @Published private(set) var level: Double = 0
     @Published private(set) var errorMessage: String?
+    @Published private(set) var recoveryStatus = ""
     private(set) var firstBufferHostTime: Double?
 
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
     var onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, Double) -> Void)?
     var onError: ((Error) -> Void)?
+    var onRecoveryStatusChanged: ((String) -> Void)?
+    var onRouteChanged: (() -> Void)?
 
     private var engine: AVAudioEngine?
+    private var engineInputID: UUID?
     private var sink: RecordingSink?
     private var captureID: UUID?
     private var startupID: UUID?
     private var lastFinishedURL: URL?
     private var configurationObserver: NSObjectProtocol?
+    private var route = AudioRouteRecovery()
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveryTaskID: UUID?
+    private var isStopping = false
 
     override init() {
         super.init()
@@ -239,73 +253,39 @@ final class AudioRecorder: NSObject, ObservableObject {
         startupID = starting
         defer { if startupID == starting { startupID = nil } }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            break
+        case .authorized: break
         case .notDetermined:
             let granted = await AVCaptureDevice.requestAccess(for: .audio)
             guard granted else { throw MediaServiceError.microphonePermission }
-        default:
-            throw MediaServiceError.microphonePermission
+        default: throw MediaServiceError.microphonePermission
         }
         try Task.checkCancellation()
         guard startupID == starting else { throw CancellationError() }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("recording-\(UUID().uuidString).caf")
         let newEngine = AVAudioEngine()
-        let input = newEngine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
+        let format = newEngine.inputNode.outputFormat(forBus: 0)
+        guard format.sampleRate.isFinite, format.sampleRate > 0, format.channelCount > 0 else {
             throw MediaServiceError.recordingUnavailable
         }
         let newSink = try RecordingSink(url: url, format: format, onCapturedBuffer: onCapturedBuffer)
-        let id = UUID()
+        let session = UUID()
+        let input = route.start()
         errorMessage = nil
         elapsed = 0
         level = 0
         firstBufferHostTime = nil
         lastFinishedURL = nil
-        captureID = id
+        setRecoveryStatus("")
+        captureID = session
         sink = newSink
-        engine = newEngine
-        input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, time in
-            let hostTime = time.isHostTimeValid
-                ? AVAudioTime.seconds(forHostTime: time.hostTime)
-                : ProcessInfo.processInfo.systemUptime
-            let result = newSink.consume(buffer, hostTime: hostTime)
-            Task { @MainActor in
-                guard let self, self.captureID == id else { return }
-                if self.firstBufferHostTime == nil { self.firstBufferHostTime = hostTime }
-                self.elapsed = result.elapsed
-                self.level = result.level
-                if let error = result.error {
-                    self.errorMessage = "录音写入失败：\(error.localizedDescription)"
-                    _ = self.stop()
-                    self.onError?(error)
-                    return
-                }
-                if let copiedBuffer = result.buffer { self.onBuffer?(copiedBuffer) }
-            }
-        }
         do {
-            newEngine.prepare()
-            try newEngine.start()
+            try installHardware(newEngine, input: input, session: session, sink: newSink)
             isRecording = true
-            configurationObserver = NotificationCenter.default.addObserver(
-                forName: .AVAudioEngineConfigurationChange, object: newEngine, queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor in
-                    guard let self, self.captureID == id, self.isRecording else { return }
-                    let error = MediaServiceError.recordingUnavailable
-                    self.errorMessage = "输入设备发生变化，录音已停止；已录内容已保留。"
-                    _ = self.stop()
-                    self.onError?(error)
-                }
-            }
         } catch {
-            newEngine.stop()
-            input.removeTap(onBus: 0)
-            newSink.close()
-            engine = nil
+            try? retireHardware()
+            try? newSink.close()
+            route.stop()
             sink = nil
             captureID = nil
             try? FileManager.default.removeItem(at: url)
@@ -313,24 +293,197 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
     }
 
+    private func installHardware(_ newEngine: AVAudioEngine, input id: UUID,
+                                 session: UUID, sink: RecordingSink) throws {
+        let node = newEngine.inputNode
+        let nativeFormat = node.outputFormat(forBus: 0)
+        try sink.activateInput(id, format: nativeFormat)
+        engine = newEngine
+        engineInputID = id
+        // Observe before start: a route can change during hardware startup.
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: newEngine, queue: .main
+        ) { [weak self] _ in
+            // Apple advises against destroying the engine synchronously in its
+            // configuration notification. Retire on a later main-actor turn.
+            Task { @MainActor in self?.configurationChanged(session: session, input: id) }
+        }
+        node.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, time in
+            let hostTime = time.isHostTimeValid
+                ? AVAudioTime.seconds(forHostTime: time.hostTime)
+                : ProcessInfo.processInfo.systemUptime
+            sink.consume(buffer, hostTime: hostTime, input: id) {
+                DispatchQueue.main.async {
+                    guard let self, self.captureID == session else { return }
+                    for result in sink.takePendingResults() {
+                        guard self.captureID == session else { break }
+                        self.receive(result, input: result.inputID)
+                    }
+                }
+            }
+        }
+        newEngine.prepare()
+        try newEngine.start()
+    }
+
+    private func receive(_ result: RecordingSink.Result, input id: UUID) {
+        if let error = result.error {
+            failRecording(error, message: "录音写入失败：\(error.localizedDescription)")
+            return
+        }
+        guard let buffer = result.buffer else { return }
+        if firstBufferHostTime == nil { firstBufferHostTime = result.hostTime }
+        elapsed = max(elapsed, result.elapsed)
+        level = result.level
+        // engine.start alone does not prove an input is supplying audio.
+        if engineInputID == id, route.accepts(input: id),
+           let recovery = route.recoveryID,
+           route.succeeded(recovery: recovery, input: id, activeHardwareInput: engineInputID) {
+            recoveryTask?.cancel()
+            recoveryTask = nil
+            recoveryTaskID = nil
+            setRecoveryStatus("麦克风已恢复，录音继续")
+        }
+        onBuffer?(buffer)
+    }
+
+    private func configurationChanged(session: UUID, input: UUID) {
+        guard captureID == session, isRecording,
+              let recovery = route.configurationChanged(input: input) else { return }
+        do { try retireHardware() }
+        catch {
+            failRecording(error, message: "录音写入失败：\(error.localizedDescription)")
+            return
+        }
+        guard captureID == session, isRecording, route.recoveryID == recovery else { return }
+        // Retired converter tails have already reached the echo queue.
+        onRouteChanged?()
+        setRecoveryStatus("音频设备已切换，正在恢复麦克风；录音继续")
+        guard recoveryTaskID == nil else { return }
+        recoveryTaskID = recovery
+        recoveryTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.recoveryTaskID == recovery {
+                    self.recoveryTask = nil
+                    self.recoveryTaskID = nil
+                }
+            }
+            let delays: [UInt64] = [200_000_000, 300_000_000, 500_000_000,
+                                    800_000_000, 1_200_000_000, 1_500_000_000]
+            for delay in delays {
+                do { try await Task.sleep(nanoseconds: delay) }
+                catch { return }
+                guard self.captureID == session, self.isRecording,
+                      self.route.recoveryID == recovery, !Task.isCancelled,
+                      let sink = self.sink else { return }
+                if AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
+                    self.failRecording(MediaServiceError.microphonePermission,
+                                       message: MediaServiceError.microphonePermission.localizedDescription)
+                    return
+                }
+                guard let input = self.route.nextAttempt(recovery: recovery) else { break }
+                do {
+                    try self.installHardware(AVAudioEngine(), input: input, session: session, sink: sink)
+                    // A running but silent/stalled graph gets a finite retry.
+                    // Digital-zero PCM counts as a working microphone stream.
+                    try await Task.sleep(nanoseconds: 1_500_000_000)
+                } catch is CancellationError { return }
+                catch {
+                    // Native startup failure is transient during route changes.
+                    // A write/converter-tail error in retirement remains fatal.
+                }
+                guard self.captureID == session, self.isRecording,
+                      self.route.recoveryID == recovery, !Task.isCancelled else { return }
+                do { try self.retireHardware() }
+                catch {
+                    self.failRecording(error, message: "录音写入失败：\(error.localizedDescription)")
+                    return
+                }
+                guard self.captureID == session, self.isRecording,
+                      self.route.recoveryID == recovery, !Task.isCancelled else { return }
+                self.route.attemptFailed(recovery: recovery, input: input)
+            }
+            guard self.captureID == session, self.route.recoveryID == recovery,
+                  !Task.isCancelled else { return }
+            self.failRecording(AudioRouteRecoveryFailure(),
+                               message: AudioRouteRecoveryFailure().localizedDescription)
+        }
+    }
+
+    private func retireHardware() throws {
+        let retired = engine
+        let input = engineInputID
+        engine = nil
+        engineInputID = nil
+        if let observer = configurationObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configurationObserver = nil
+        }
+        defer {
+            retired?.stop()
+            retired?.inputNode.removeTap(onBus: 0)
+        }
+        if let input, let sink {
+            for result in try sink.retireInput(input) {
+                guard captureID != nil else { break }
+                receive(result, input: result.inputID)
+            }
+        } else if let sink {
+            for result in sink.takePendingResults() {
+                guard captureID != nil else { break }
+                receive(result, input: result.inputID)
+            }
+        }
+    }
+
+    private func setRecoveryStatus(_ status: String) {
+        recoveryStatus = status
+        onRecoveryStatusChanged?(status)
+    }
+
+    private func failRecording(_ error: Error, message: String) {
+        guard captureID != nil else { return }
+        errorMessage = message
+        // MeetingRecorder reads this warning after explicit Stop. It must not
+        // re-enter the meeting's stop operation while flushing its last PCM.
+        if isStopping { return }
+        _ = stop()
+        onError?(error)
+    }
+
     @discardableResult
     func stop() -> URL? {
+        guard !isStopping else { return sink?.url ?? lastFinishedURL }
+        isStopping = true
+        defer { isStopping = false }
         startupID = nil
-        guard let engine else { return lastFinishedURL }
-        captureID = nil
-        engine.stop()
-        engine.inputNode.removeTap(onBus: 0)
-        let url = sink?.url
-        if firstBufferHostTime == nil { firstBufferHostTime = sink?.capturedStartHostTime }
-        sink?.close()
-        sink = nil
-        self.engine = nil
-        if let configurationObserver {
-            NotificationCenter.default.removeObserver(configurationObserver)
-            self.configurationObserver = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        recoveryTaskID = nil
+        route.stop()
+        isRecording = false
+        // Recovery can temporarily have no engine; the same sink still owns
+        // the complete recording and must always be closed on explicit Stop.
+        guard let sink else {
+            captureID = nil
+            return lastFinishedURL
         }
+        let url = sink.url
+        do {
+            try retireHardware()
+            for result in try sink.close() { receive(result, input: result.inputID) }
+        } catch {
+            errorMessage = "录音最后一段写入失败：\(error.localizedDescription)"
+            try? sink.close()
+        }
+        if firstBufferHostTime == nil { firstBufferHostTime = sink.capturedStartHostTime }
+        route.stop()
+        captureID = nil
+        self.sink = nil
         isRecording = false
         level = 0
+        setRecoveryStatus("")
         lastFinishedURL = url
         return url
     }
@@ -342,133 +495,14 @@ final class AudioRecorder: NSObject, ObservableObject {
         elapsed = 0
     }
 
-    @objc private func applicationWillTerminate(_ notification: Notification) {
-        _ = stop()
-    }
+    @objc private func applicationWillTerminate(_ notification: Notification) { _ = stop() }
 
     deinit {
+        recoveryTask?.cancel()
         engine?.stop()
-        sink?.close()
-        if let configurationObserver {
-            NotificationCenter.default.removeObserver(configurationObserver)
-        }
+        try? sink?.close()
+        if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
         NotificationCenter.default.removeObserver(self)
-    }
-}
-
-/// 仅在音频回调中写盘；复制的 buffer 才可交给主线程，tap 的原 buffer 会被复用。
-private final class RecordingSink: @unchecked Sendable {
-    struct Result {
-        let buffer: AVAudioPCMBuffer?
-        let level: Double
-        let elapsed: Double
-        let error: Error?
-    }
-
-    let url: URL
-    private let lock = NSLock()
-    private var file: AVAudioFile?
-    private var frames: AVAudioFramePosition = 0
-    private let sampleRate: Double
-    private var firstHostTime: Double?
-    private var failed = false
-    private let onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, Double) -> Void)?
-
-    init(url: URL, format: AVAudioFormat,
-         onCapturedBuffer: (@Sendable (AVAudioPCMBuffer, Double) -> Void)? = nil) throws {
-        self.url = url
-        self.onCapturedBuffer = onCapturedBuffer
-        sampleRate = format.sampleRate
-        file = try AVAudioFile(forWriting: url, settings: format.settings,
-                               commonFormat: format.commonFormat, interleaved: format.isInterleaved)
-    }
-
-    func consume(_ buffer: AVAudioPCMBuffer, hostTime: Double) -> Result {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let file, !failed else {
-            return Result(buffer: nil, level: 0,
-                          elapsed: Double(frames) / sampleRate, error: nil)
-        }
-        do {
-            if firstHostTime == nil { firstHostTime = hostTime }
-            if let firstHostTime {
-                let gap = hostTime - firstHostTime - Double(frames) / sampleRate
-                if gap > 0.02 {
-                    try appendSilence(frames: AVAudioFramePosition((gap * sampleRate).rounded()),
-                                      format: buffer.format, file: file)
-                } else if gap < -0.25 {
-                    throw MediaServiceError.recordingUnavailable
-                }
-            }
-            try file.write(from: buffer)
-            frames += AVAudioFramePosition(buffer.frameLength)
-            let copied = Self.copy(buffer)
-            if let copied { onCapturedBuffer?(copied, hostTime) }
-            return Result(buffer: copied, level: Self.rms(buffer),
-                          elapsed: Double(frames) / sampleRate, error: nil)
-        } catch {
-            failed = true
-            return Result(buffer: nil, level: 0,
-                          elapsed: Double(frames) / sampleRate, error: error)
-        }
-    }
-
-    func close() {
-        lock.lock()
-        file = nil
-        lock.unlock()
-    }
-
-    var capturedStartHostTime: Double? {
-        lock.lock()
-        defer { lock.unlock() }
-        return firstHostTime
-    }
-
-    private func appendSilence(frames missingFrames: AVAudioFramePosition,
-                               format: AVAudioFormat, file: AVAudioFile) throws {
-        guard missingFrames > 0,
-              let silence = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 8192) else { return }
-        var remaining = missingFrames
-        while remaining > 0 {
-            let count = AVAudioFrameCount(min(8192, remaining))
-            silence.frameLength = count
-            for audioBuffer in UnsafeMutableAudioBufferListPointer(silence.mutableAudioBufferList) {
-                if let data = audioBuffer.mData { memset(data, 0, Int(audioBuffer.mDataByteSize)) }
-            }
-            try file.write(from: silence)
-            frames += AVAudioFramePosition(count)
-            remaining -= AVAudioFramePosition(count)
-        }
-    }
-
-    private static func copy(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format,
-                                         frameCapacity: buffer.frameLength) else { return nil }
-        copy.frameLength = buffer.frameLength
-        let source = UnsafeMutableAudioBufferListPointer(
-            UnsafeMutablePointer(mutating: buffer.audioBufferList)
-        )
-        let destination = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
-        guard source.count == destination.count else { return nil }
-        for index in source.indices {
-            guard let src = source[index].mData, let dst = destination[index].mData else { continue }
-            let count = min(source[index].mDataByteSize, destination[index].mDataByteSize)
-            memcpy(dst, src, Int(count))
-        }
-        return copy
-    }
-
-    private static func rms(_ buffer: AVAudioPCMBuffer) -> Double {
-        guard let data = buffer.floatChannelData, buffer.frameLength > 0 else { return 0 }
-        let count = Int(buffer.frameLength)
-        var sum: Double = 0
-        for index in 0..<count {
-            let value = Double(data[0][index * Int(buffer.stride)])
-            sum += value * value
-        }
-        return min(1, sqrt(sum / Double(count)) * 4)
     }
 }
 

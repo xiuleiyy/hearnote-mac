@@ -30,6 +30,8 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         var invalidMicrophone: Int64 = 0
         var invalidReference: Int64 = 0
         var processorFailure: Int64 = 0
+        // Optional so archives made before hardware-route recovery still decode.
+        var audioRouteChange: Int64? = 0
     }
 
     /// Energy changes include local speech and noise; they do not measure ERLE
@@ -61,6 +63,7 @@ final class MeetingEchoProcessor: @unchecked Sendable {
     private enum FilterResetReason {
         case microphoneDiscontinuity, referenceDiscontinuity, referenceDrift
         case missingReference, invalidMicrophone, invalidReference, processorFailure
+        case audioRouteChange
     }
 
     struct Result: Sendable {
@@ -271,6 +274,19 @@ final class MeetingEchoProcessor: @unchecked Sendable {
             } catch {
                 degrade(error)
             }
+        }
+    }
+
+    /// A changed output device changes the acoustic path even when input PCM
+    /// keeps the same format. Capture has already retired/flushed its old tap.
+    /// Preserve its pending samples and the system track; reset only adaptation.
+    func audioRouteDidChange() {
+        queue.async { [self] in
+            guard !isCancelled, !finished, failure == nil else { return }
+            drainMicrophone(finishing: true)
+            guard failure == nil else { return }
+            resetFilter(reason: .audioRouteChange)
+            setStatus("音频设备已切换，回声处理正在重新适应声音")
         }
     }
 
@@ -569,6 +585,8 @@ final class MeetingEchoProcessor: @unchecked Sendable {
         case .invalidMicrophone: filterResetReasonCounts.invalidMicrophone += 1
         case .invalidReference: filterResetReasonCounts.invalidReference += 1
         case .processorFailure: filterResetReasonCounts.processorFailure += 1
+        case .audioRouteChange:
+            filterResetReasonCounts.audioRouteChange = (filterResetReasonCounts.audioRouteChange ?? 0) + 1
         }
     }
 

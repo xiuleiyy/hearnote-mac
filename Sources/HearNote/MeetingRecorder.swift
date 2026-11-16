@@ -70,6 +70,7 @@ final class MeetingRecorder: ObservableObject {
     @Published private(set) var microphoneAudioLevel: Double = 0
     @Published private(set) var systemAudioLevel: Double = 0
     @Published private(set) var echoStatus = ""
+    @Published private(set) var microphoneRecoveryStatus = ""
     /// The latest saved session's originals. Starting a new session clears this
     /// shortcut, while earlier sessions remain in Recording/Originals.
     @Published private(set) var originalTracksDirectory: URL?
@@ -112,6 +113,7 @@ final class MeetingRecorder: ObservableObject {
         source = requestedSource
         errorMessage = nil
         echoStatus = ""
+        microphoneRecoveryStatus = ""
         originalTracksDirectory = nil
         elapsed = 0
         level = 0
@@ -201,6 +203,16 @@ final class MeetingRecorder: ObservableObject {
             mic?.onError = { [weak self] error in
                 self?.recordFailure(error, for: sessionID)
             }
+            mic?.onRecoveryStatusChanged = { [weak self] status in
+                guard let self, self.generation == sessionID,
+                      self.phase == .starting || self.phase == .recording else { return }
+                self.microphoneRecoveryStatus = status
+            }
+            mic?.onRouteChanged = { [weak self] in
+                guard let self, self.generation == sessionID,
+                      self.phase == .starting || self.phase == .recording else { return }
+                self.echoProcessor?.audioRouteDidChange()
+            }
             system?.onBuffer = { [weak self] pcm, hostTime in
                 guard let self, self.generation == sessionID,
                       self.phase != .idle else {
@@ -268,6 +280,11 @@ final class MeetingRecorder: ObservableObject {
         let destination = outputDirectory
         let microphoneURL = mic?.stop()
         let microphoneHostTime = mic?.firstBufferHostTime
+        if errorMessage == nil, let warning = mic?.errorMessage {
+            // Closing the hardware/converter may fail after capture stopped.
+            // Preserve its file and expose the warning in the saved meeting.
+            errorMessage = warning
+        }
         let systemRecording = await system?.stop()
         let echoRecording = await echo?.finish()
         guard generation == sessionID else { throw CancellationError() }
@@ -499,6 +516,8 @@ final class MeetingRecorder: ObservableObject {
         microphone?.onBuffer = nil
         microphone?.onCapturedBuffer = nil
         microphone?.onError = nil
+        microphone?.onRecoveryStatusChanged = nil
+        microphone?.onRouteChanged = nil
         microphone = nil
         systemCapture = nil
         echoProcessor = nil
@@ -511,6 +530,7 @@ final class MeetingRecorder: ObservableObject {
         systemLevel = 0
         microphoneAudioLevel = 0
         systemAudioLevel = 0
+        microphoneRecoveryStatus = ""
     }
 
     private static func authorizeMicrophone() async throws {

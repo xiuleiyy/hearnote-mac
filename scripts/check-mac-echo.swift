@@ -64,6 +64,8 @@ struct MacEchoHarness {
         try await adaptationAfterReset(.invalidReference, root: root)
         try await adaptationAfterReset(.invalidMicrophone, root: root)
         try await adaptationAfterReset(.referenceFormat, root: root)
+        try await adaptationAfterReset(.audioRouteChange, root: root)
+        try await routeChangePreservesPartialFrame(root: root)
         try await lateReference(captureAge: 0, root: root)
         try await lateReference(captureAge: 0.25, root: root)
         try await wholePacketDeadline(root: root)
@@ -76,7 +78,7 @@ struct MacEchoHarness {
         try await cancelIsolation(root: root)
         try originalTracksPersist(root: root)
         try originalTracksPreservedOnArchiveFailure(root: root)
-        print("Mac echo integration: 21 synthetic checks passed; no microphone, model, or API permission used. These checks do not establish hardware AEC effectiveness.")
+        print("Mac echo integration: 23 synthetic checks passed; no microphone, model, or API permission used. These checks do not establish hardware AEC effectiveness.")
     }
 
     static func hostNow() -> Double {
@@ -221,7 +223,7 @@ struct MacEchoHarness {
     }
 
     private enum AdaptationReset: String {
-        case missingReference, invalidReference, invalidMicrophone, referenceFormat
+        case missingReference, invalidReference, invalidMicrophone, referenceFormat, audioRouteChange
     }
 
     @MainActor
@@ -261,6 +263,10 @@ struct MacEchoHarness {
                     "\(name): uninterrupted processing never left the initial history hint")
         collector.statuses.removeAll()
 
+        if kind == .audioRouteChange {
+            processor.audioRouteDidChange()
+            await processor.synchronize()
+        }
         clock.advance(to: 4)
         try appendPair(
             start: initialSamples,
@@ -308,22 +314,32 @@ struct MacEchoHarness {
         case .referenceFormat:
             try require(resets.referenceDiscontinuity >= 3,
                         "\(name): reference format changes did not reset filter history")
+        case .audioRouteChange:
+            try require(resets.audioRouteChange == 1,
+                        "\(name): output-only change did not reset acoustic history exactly once")
         }
         let resetTotal = resets.microphoneDiscontinuity + resets.referenceDiscontinuity
             + resets.referenceDrift + resets.missingReference + resets.invalidMicrophone
-            + resets.invalidReference + resets.processorFailure
+            + resets.invalidReference + resets.processorFailure + (resets.audioRouteChange ?? 0)
         try require(resetTotal == result.diagnostics.filterResets, "\(name): reset-reason counts disagree with total")
         let encoded = try JSONEncoder().encode(result.diagnostics)
         if kind == .missingReference {
             guard var legacy = try JSONSerialization.jsonObject(with: encoded) as? [String: Any],
-                  let reasonFields = legacy["filterResetReasonCounts"] as? [String: Any] else {
+                  var reasonFields = legacy["filterResetReasonCounts"] as? [String: Any] else {
                 throw HarnessFailure.assertion("\(name): reset diagnostics were not encoded")
             }
             let allowedReasons: Set<String> = [
                 "microphoneDiscontinuity", "referenceDiscontinuity", "referenceDrift",
-                "missingReference", "invalidMicrophone", "invalidReference", "processorFailure"
+                "missingReference", "invalidMicrophone", "invalidReference", "processorFailure",
+                "audioRouteChange"
             ]
             try require(Set(reasonFields.keys) == allowedReasons, "\(name): reset causes are not a fixed allowlist")
+            reasonFields.removeValue(forKey: "audioRouteChange")
+            legacy["filterResetReasonCounts"] = reasonFields
+            let previousVersion = try JSONDecoder().decode(MeetingEchoProcessor.Diagnostics.self,
+                from: JSONSerialization.data(withJSONObject: legacy))
+            try require(previousVersion.filterResetReasonCounts?.audioRouteChange == nil,
+                        "\(name): archived reason counts require the route field")
             for key in ["referenceMaximumContinuousDriftFrames", "referenceDriftReanchors",
                         "filterResetReasonCounts", "continuousProcessedSamples"] {
                 legacy.removeValue(forKey: key)
@@ -339,6 +355,38 @@ struct MacEchoHarness {
                         "\(name): archived diagnostics require the newly added fields")
         }
         diagnostic("\(name) totalProcessedSamples=\(result.diagnostics.processedSamples) continuousProcessedSamples=\(continuous) filterResets=\(resetTotal)")
+    }
+
+    @MainActor
+    private static func routeChangePreservesPartialFrame(root: URL) async throws {
+        let collector = Collector()
+        let epoch = hostNow()
+        let processor = try processor(name: "route-partial-frame", root: root, epoch: epoch,
+                                      collector: collector)
+        for start in [0, 160] {
+            let time = epoch + Double(start) / 16_000
+            processor.appendReference(try buffer(rate: 16_000, start: start, count: 160) { _ in 0 },
+                                      hostTime: time)
+            processor.appendMicrophone(try buffer(rate: 16_000, start: start, count: 160) { _ in 0.03 },
+                                       hostTime: time)
+            if start == 0 {
+                processor.audioRouteDidChange()
+                await processor.synchronize()
+                try require(collector.samples.count == 160,
+                            "route-partial-frame: old pending voice was discarded or duplicated")
+            }
+        }
+        let result = await processor.finish()
+        try verifyFile(result, collector: collector, expected: 320, name: "route-partial-frame")
+        try require(result.diagnostics.filterResetReasonCounts?.audioRouteChange == 1,
+                    "route-partial-frame: missing route reset")
+        try require(collector.samples.allSatisfy { abs($0 - 0.03) < 0.0001 },
+                    "route-partial-frame: route reset muted retained voice")
+        processor.audioRouteDidChange()
+        let stopped = await processor.finish()
+        try require(stopped.frameCount == result.frameCount
+                    && stopped.diagnostics.filterResets == result.diagnostics.filterResets,
+                    "route-partial-frame: late route event changed finished capture")
     }
 
     @MainActor
