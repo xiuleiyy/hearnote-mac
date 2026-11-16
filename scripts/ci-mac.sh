@@ -34,6 +34,10 @@ if ! bash scripts/check-mac-echo.sh 2>&1 | tee dist/ci/echo-check.log; then
     echo "Mac 音频处理器合成检查失败；不能标记回声处理为已验证。" > dist/ci/结果说明.md
     exit 1
 fi
+if ! bash scripts/check-mac-speech-evidence.sh 2>&1 | tee dist/ci/speech-evidence-check.log; then
+    echo "Apple 识别输入的合成 PCM 检查失败；不能标记数字静音保护为已验证。" > dist/ci/结果说明.md
+    exit 1
+fi
 if ! bash scripts/package-mac.sh 2>&1 | tee dist/ci/package.log; then
     echo "DMG 打包失败；请查看真实构建日志。" > dist/ci/结果说明.md
     exit 1
@@ -72,6 +76,7 @@ git diff "$hearnote_feedback_base" HEAD -- Sources/ Tests/ scripts/ Resources/ P
     echo "- 完整 Core XCTest、release 编译、签名与架构检查：通过，数量见 build.log。"
     echo "- App 移动后独立启动检查、DMG 校验及只读挂载检查：通过，详见 verify.log。"
     echo "- Mac 回声处理器合成检查：通过，详见 echo-check.log；不代表真实外放或双讲实机验收。"
+    echo "- Apple 输入的逐声道数字静音合成检查：通过，详见 speech-evidence-check.log；未运行真实语音识别。"
     echo "- 麦克风、系统音、Apple／Whisper 推理、翻译、北京网络速度及 GUI 功能：未测。"
     echo "- 未使用客户 Bedrock API Key；不是 Mac 实机功能验收完成。"
     echo

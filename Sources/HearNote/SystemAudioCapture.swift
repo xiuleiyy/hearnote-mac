@@ -16,7 +16,7 @@ enum SystemAudioCaptureError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .permission(let detail):
-            return "无法获取系统声音录制权限。请在「系统设置 → 隐私与安全性 → 屏幕录制」允许听译，必要时退出并重新打开 App。\(detail)"
+            return "无法获取系统声音录制权限。请在「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」（旧系统为「屏幕录制」）允许听译。升级后仍拒绝时，请退出 App，在该列表移除旧听译并添加「应用程序」中的当前版本，再重新打开。\(detail)"
         case .noDisplay:
             return "没有可用于获取系统声音的显示器。请连接显示器后重试。"
         case .noAudio:

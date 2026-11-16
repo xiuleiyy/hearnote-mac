@@ -36,6 +36,19 @@ GATEKEEPER_OPENING_GUIDE = (
     "完成授权后，这次安装通常可以直接双击打开。\n\n"
     "无需关闭系统整体保护。[Apple 官方说明](https://support.apple.com/zh-cn/102445)。\n\n"
 )
+UPGRADE_PERMISSION_GUIDE = (
+    "## 升级后录音权限仍被拒绝时\n\n"
+    "先保存会议并退出旧版，将新版复制到“应用程序”，再从那里打开。"
+    "当前使用 ad-hoc 签名，旧版授权可能与新版签名不匹配；列表已开启不一定代表新版已获权。\n\n"
+    "系统声音仍拒绝时，退出听译，在“系统设置 → 隐私与安全性 → "
+    "屏幕与系统音频录制”（旧系统为“屏幕录制”）移除失效的旧听译项，"
+    "再用该页面的添加按钮选“应用程序”中的当前听译.app，开启权限，按提示重新打开。\n\n"
+    "麦克风权限在同级“麦克风”页面单独开启；该页面通常没有添加／移除按钮。"
+    "不要删除权限数据库、重置其他 App 的授权或关闭系统保护。"
+    "正式 Developer ID 签名和公证尚未完成，不能保证后续升级自动沿用授权。\n\n"
+    "[Apple 录制权限说明]"
+    "(https://support.apple.com/guide/mac-help/control-access-to-screen-recording-on-mac-mchld6aa7d23/mac)。\n\n"
+)
 
 
 class ReleaseError(RuntimeError):
@@ -196,6 +209,7 @@ def prepare_assets(args, destination: Path) -> list[Path]:
         "4. 按录音来源授予麦克风／系统录制权限；首次使用 Whisper 需下载或导入本地模型，"
         "之后复用缓存。\n\n"
         + GATEKEEPER_OPENING_GUIDE
+        + UPGRADE_PERMISSION_GUIDE
         + f"源码提交：`{args.commit}`。\n\n"
         "自动构建验证不代表真实会议识别准确度、外放双讲或北京网络延迟已经验收。\n",
         encoding="utf-8",

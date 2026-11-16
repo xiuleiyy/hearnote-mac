@@ -39,6 +39,10 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
     private var inputBudget = AppleSpeechInputBudget()
     private var timeline = AppleSpeechInputTimeline()
     private var mapper = AppleSpeechResultMapper()
+    private var audioEvidence = AppleSpeechAudioEvidence()
+    private let evidenceLogger = Logger(
+        subsystem: "app.hearnote.mac", category: "AppleSpeechAudioEvidence"
+    )
     private var origin = Date()
     private var source = ""
     private var acceptingAudio = false
@@ -69,6 +73,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         failure = onError
         currentFailure = nil
         mapper = AppleSpeechResultMapper()
+        audioEvidence = AppleSpeechAudioEvidence()
         timeline = AppleSpeechInputTimeline()
         inputBudget = AppleSpeechInputBudget()
         setState("正在检查本机语言支持…", ready: false)
@@ -251,9 +256,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
                 guard let self, self.runID == id else { return }
                 await self.resultTask?.value
                 guard self.runID == id else { return }
-                for result in self.mapper.finishSuccessfully() {
-                    self.update?(result.segment, result.isFinal)
-                }
+                self.publish(self.mapper.finishSuccessfully())
                 self.complete(id: id, status: "已停止")
             } catch {
                 guard let self, self.runID == id else { return }
@@ -291,6 +294,7 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         runID = nil
         acceptingAudio = false
         receivedAudio = false
+        audioEvidence = AppleSpeechAudioEvidence()
         progressTask?.cancel()
         progressTask = nil
         resultTask?.cancel()
@@ -526,6 +530,11 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         )
         switch continuation.yield(QueuedInput(input: input, token: token)) {
         case .enqueued:
+            // Record the converted PCM that entered this run's sequence. A failed
+            // yield, gap or unsupported layout can never prove digital silence.
+            audioEvidence.record(
+                start: start, duration: duration, content: AppleSpeechPCMScanner.content(of: buffer)
+            )
             receivedAudio = true
             setState("识别中", ready: true)
             return true
@@ -543,9 +552,14 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
         let start = range.start.seconds
         let end = CMTimeRangeGetEnd(range).seconds
         let fragments = timedFragments(text, fallback: range)
+        let nativeText = String(text.characters)
+        let accepted = accepts(nativeText, start: start, end: end)
         let updates = mapper.receive(
-            text: String(text.characters), start: start, end: end, isFinal: isFinal,
-            resultsFinalizationTime: finalizationTime.seconds, source: source, timedText: fragments
+            // Keep empty revisions and watermarks flowing so pending text can be
+            // retracted/finalized even when this native word has zero PCM evidence.
+            text: accepted ? nativeText : "", start: start, end: end, isFinal: isFinal,
+            resultsFinalizationTime: finalizationTime.seconds, source: source,
+            timedText: accepted ? fragments : []
         )
         fileDiagnostics?.recordResult(
             characters: text.characters.count, start: start, end: end,
@@ -553,8 +567,33 @@ final class AppleAnalyzerSpeechService: AppleSpeechStreamingService {
             fragmentCount: fragments.count, updates: updates,
             unmappableRevisions: mapper.unmappableRevisionCount
         )
-        for result in updates {
-            update?(result.segment, result.isFinal)
+        publish(updates)
+    }
+
+    private func publish(_ results: [AppleSpeechResultMapper.Update]) {
+        for result in results {
+            // A watermark/finish may promote an earlier result whose range was
+            // still uncovered then. Recheck with the PCM now actually submitted,
+            // and retract along its existing UUID rather than leaving a ghost.
+            let validated = audioEvidence.validate(result)
+            if validated != result {
+                logEvidenceRejection(start: result.segment.start, end: result.segment.end)
+            }
+            update?(validated.segment, validated.isFinal)
+        }
+    }
+
+    private func accepts(_ text: String, start: Double, end: Double) -> Bool {
+        guard !audioEvidence.accepts(text: text, start: start, end: end) else { return true }
+        logEvidenceRejection(start: start, end: end)
+        return false
+    }
+
+    private func logEvidenceRejection(start: Double, end: Double) {
+        let count = audioEvidence.rejectedZeroResultCount
+        if count <= 8, let runID {
+            let run = runID.uuidString
+            evidenceLogger.notice("run=\(run, privacy: .public) cause=confirmedZero count=\(count, privacy: .public) start=\(start, privacy: .public) end=\(end, privacy: .public)")
         }
     }
 

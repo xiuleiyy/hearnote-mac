@@ -155,6 +155,10 @@ final class LiveSpeechRecognizer: ObservableObject {
             stream.receivedAudio = true
         }
         stream.request.append(buffer)
+        stream.audioEvidence.record(
+            start: stream.offset + stream.audioDuration, duration: incomingDuration,
+            content: AppleSpeechPCMScanner.content(of: buffer)
+        )
         stream.audioDuration += incomingDuration
         if recognitionStatus != "识别中" { recognitionStatus = "识别中" }
     }
@@ -185,7 +189,12 @@ final class LiveSpeechRecognizer: ObservableObject {
                 }
             }
             stream.request.append(silence)
-            stream.audioDuration += Double(count) / format.sampleRate
+            let duration = Double(count) / format.sampleRate
+            stream.audioEvidence.record(
+                start: stream.offset + stream.audioDuration, duration: duration,
+                content: AppleSpeechPCMScanner.content(of: silence)
+            )
+            stream.audioDuration += duration
             remaining -= count
         }
     }
@@ -359,12 +368,22 @@ final class LiveSpeechRecognizer: ObservableObject {
                                                         length: endIndex - startIndex))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
+            let start = max(0, stream.offset + first.timestamp)
+            let nativeEnd = stream.offset + last.timestamp + last.duration
+            // Recognition streams rotate independently; their evidence must not
+            // leak across requests or between microphone and system input.
+            if !stream.audioEvidence.accepts(text: text, start: start, end: nativeEnd) {
+                if var previous = stream.latest.removeValue(forKey: bucket)?.segment {
+                    previous.text = ""
+                    update?(previous, result.isFinal || bucket != buckets.last)
+                }
+                continue
+            }
             let segmentID = stream.segmentIDs[bucket] ?? UUID()
             stream.segmentIDs[bucket] = segmentID
-            let start = max(0, stream.offset + first.timestamp)
             let segment = TranscriptSegment(
                 id: segmentID, start: start,
-                end: max(start + 0.1, stream.offset + last.timestamp + last.duration),
+                end: max(start + 0.1, nativeEnd),
                 text: text, source: stream.source
             )
             // 前面短句已过时轴边界可用于翻译；Speech仍可更正，沿同UUID替换。
@@ -438,6 +457,7 @@ private final class RecognitionStream {
     let source: String
     var offset: Double
     var audioDuration: Double = 0
+    var audioEvidence = AppleSpeechAudioEvidence()
     var task: SFSpeechRecognitionTask?
     var deadline: Task<Void, Never>?
     var receivedAudio = false
